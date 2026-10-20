@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+out/
+dist/
+
+# 日志与临时文件
+*.log
+logs/
+*.tmp
+*.tmp.*
+*.bak
+*.swp
+
+# 本机环境与密钥
+.env
+.env.*
+*.pem
+*.key
+
+# 测试覆盖率与系统文件
+coverage/
+.DS_Store
+Thumbs.db
