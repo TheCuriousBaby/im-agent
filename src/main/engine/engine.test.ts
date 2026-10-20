@@ -14,6 +14,7 @@ import type {
 import type { CapturedFrame } from '../capture/screenshot'
 import type { InputBackend } from '../executor/inputBackend'
 import { InputController } from '../executor/inputController'
+import { THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH } from '../capture/frameDiff'
 import { Engine } from './engine'
 
 const TARGET: TargetWindow = {
@@ -70,6 +71,17 @@ interface Harness {
   visionCalls: number
 }
 
+// 与真实缩略图同尺寸的 BGRA 位图：右下角区域按 flip 交替，保证整帧检测能看到变化；会话列表区域随 listVersion 变化
+function makeThumbnail(flip: boolean, listVersion: number): Uint8Array {
+  const data = new Uint8Array(THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4).fill(120)
+  const paint = (x0: number, x1: number, y0: number, y1: number, value: number): void => {
+    for (let y = y0; y < y1; y++) data.fill(value, (y * THUMBNAIL_WIDTH + x0) * 4, (y * THUMBNAIL_WIDTH + x1) * 4)
+  }
+  if (flip) paint(100, THUMBNAIL_WIDTH, 96, THUMBNAIL_HEIGHT, 0)
+  if (listVersion % 2 === 1) paint(0, 56, 10, 110, 30)
+  return data
+}
+
 interface VisionCall {
   expectSearchResults: boolean
 }
@@ -84,6 +96,7 @@ function harness(
     idleRefreshMs?: number
     failDecideTimes?: number
     failVisionTimes?: number
+    listState?: { version: number }
     visionFn?: (call: VisionCall, index: number) => Observation
   } = {}
 ): Harness {
@@ -128,7 +141,7 @@ function harness(
         screenRect: { ...TARGET.rect },
         takenAt: 0
       },
-      thumbnail: new Uint8Array(16).fill(options.staticFrames || frameNo % 2 !== 0 ? 120 : 0)
+      thumbnail: makeThumbnail(!options.staticFrames && frameNo % 2 === 0, options.listState?.version ?? 0)
     }
   }
 
@@ -431,4 +444,50 @@ test('回复决策失败后，新消息不会被当作已处理，重试后仍�
   h.engine.stop()
   assert.equal(h.decideCalls >= 2, true)
   assert.equal(pending?.text, '重试后的回复')
+})
+
+test('点击未读前会话列表已被重排，会重新识别并按新位置点击', async () => {
+  const list = { version: 0 }
+  const oldDot = box(0, 200, 280, 260)
+  const newDot = box(0, 600, 280, 660)
+  const h = harness([], {
+    skip: true,
+    listState: list,
+    visionFn: (_call, index) => {
+      if (index === 0) return observation('群', [msg('peer', '甲')])
+      if (index === 1) {
+        list.version++
+        return observation('群', [msg('peer', '甲'), msg('peer', '乙')], { unreadDots: [oldDot] })
+      }
+      if (index === 2) return observation('群', [msg('peer', '甲'), msg('peer', '乙')], { unreadDots: [newDot] })
+      return observation('Bob', [msg('peer', '丙')])
+    }
+  })
+  h.engine.start(TARGET)
+  await waitFor(() => h.backend.calls.some((c) => c.startsWith('move:')))
+  h.engine.stop()
+  const firstMove = h.backend.calls.find((c) => c.startsWith('move:')) ?? ''
+  const y = Number(firstMove.split(',')[1])
+  assert.equal(y >= 250, true, `应点在新位置（y≥250），实际 ${firstMove}`)
+  assert.equal(h.visionCalls >= 3, true)
+})
+
+test('会话列表已变化且重新识别后没有红点，则放弃这次点击', async () => {
+  const list = { version: 0 }
+  const h = harness([], {
+    skip: true,
+    listState: list,
+    visionFn: (_call, index) => {
+      if (index === 0) return observation('群', [msg('peer', '甲')])
+      if (index === 1) {
+        list.version++
+        return observation('群', [msg('peer', '甲'), msg('peer', '乙')], { unreadDots: [box(0, 200, 280, 260)] })
+      }
+      return observation('群', [msg('peer', '甲'), msg('peer', '乙')])
+    }
+  })
+  h.engine.start(TARGET)
+  await waitFor(() => h.visionCalls >= 5)
+  h.engine.stop()
+  assert.equal(h.backend.calls.includes('click'), false)
 })

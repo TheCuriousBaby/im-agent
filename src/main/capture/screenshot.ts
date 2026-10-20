@@ -2,14 +2,13 @@
 import { desktopCapturer, screen } from 'electron'
 import type { Frame, Rect, TargetWindow } from '../../shared/types'
 import { clamp } from './coords'
+import { THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH } from './frameDiff'
 
 export interface CapturedFrame {
   frame: Frame
   thumbnail: Uint8Array
 }
 
-const THUMBNAIL_WIDTH = 192
-const THUMBNAIL_HEIGHT = 120
 const JPEG_QUALITY = 85
 
 function intersect(a: Rect, b: Rect): Rect | null {

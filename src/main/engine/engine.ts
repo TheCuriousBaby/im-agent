@@ -14,7 +14,7 @@ import type {
   TaskStatus
 } from '../../shared/types'
 import { normBoxToScreenPoint, SAFE_RANGES } from '../capture/coords'
-import { hasFrameChanged } from '../capture/frameDiff'
+import { changedFractionInBox, hasFrameChanged } from '../capture/frameDiff'
 import type { CapturedFrame } from '../capture/screenshot'
 import { isAborted } from '../abort'
 import type { InputController } from '../executor/inputController'
@@ -52,6 +52,8 @@ const UNREAD_EMPTY_SWITCH_LIMIT = 3
 const UNREAD_COOLDOWN_MS = 60000
 const MAX_PENDING_REPLIES = 20
 const MAX_RESPOND_FAILURES = 3
+const SESSION_LIST_CHANGE_RATIO = 0.01
+const DEFAULT_SESSION_LIST: [number, number, number, number] = [0, 0, 350, 1000]
 
 interface OutboxItem {
   text: string
@@ -64,6 +66,7 @@ type RespondOutcome = 'none' | 'skipped' | 'pending' | 'sent'
 interface CachedObservation {
   observation: Observation
   frame: Frame
+  thumbnail: Uint8Array
   at: number
 }
 
@@ -325,7 +328,7 @@ export class Engine {
       this.forceObserve = true
       throw error
     }
-    this.cached = { observation, frame, at: this.now() }
+    this.cached = { observation, frame, thumbnail, at: this.now() }
     this.lastObservedAt = this.now()
     logger.info(
       `识别结果：会话「${observation.conversationTitle || '未识别'}」，消息 ${observation.messages.length} 条，未读红点 ${observation.unreadDots.length} 个，输入框${observation.inputArea ? '已识别' : '未识别'}`
@@ -437,7 +440,12 @@ export class Engine {
     if (settings.engine.unreadSwitch === 'hotkey') {
       await this.deps.input.hotkey('g', ['control'], signal)
     } else {
-      const point = normBoxToScreenPoint(observation.unreadDots[0], cached.frame.screenRect, SAFE_RANGES.sessionItem)
+      const point = await this.locateUnreadDot(observation, cached, signal)
+      if (!point) {
+        this.forceObserve = true
+        this.setPhase('POLLING')
+        return
+      }
       await this.deps.input.clickAt(point, signal)
     }
     await this.deps.input.pause(800, 1100, signal)
@@ -447,6 +455,35 @@ export class Engine {
     this.forceObserve = true
     this.treatNextAsNew = true
     this.cached = null
+  }
+
+  // 点击前核对会话列表：识别之后列表可能已经变化（新消息会让会话跳到顶部），位置变了就重新识别再取坐标
+  private async locateUnreadDot(
+    observation: Observation,
+    cached: CachedObservation,
+    signal: AbortSignal
+  ): Promise<{ x: number; y: number } | null> {
+    const target = this.target
+    if (!target) return null
+    const info = await this.deps.windows.getInfo(target.hwnd)
+    if (!info) throw new Error('目标窗口已关闭或最小化')
+    this.target = info
+    const fresh = await this.deps.capture(info, this.deps.settings().vision.maxImageSide)
+
+    const listBox = observation.sessionList ?? DEFAULT_SESSION_LIST
+    const moved = changedFractionInBox(cached.thumbnail, fresh.thumbnail, listBox) > SESSION_LIST_CHANGE_RATIO
+    if (!moved) {
+      return normBoxToScreenPoint(observation.unreadDots[0], fresh.frame.screenRect, SAFE_RANGES.sessionItem)
+    }
+
+    logger.info('会话列表在识别之后发生了变化，重新识别后再点击')
+    const again = await this.deps.vision.observe(fresh.frame, { signal })
+    this.cached = { observation: again, frame: fresh.frame, thumbnail: fresh.thumbnail, at: this.now() }
+    if (again.unreadDots.length === 0) {
+      logger.info('重新识别后没有未读红点，放弃这次切换')
+      return null
+    }
+    return normBoxToScreenPoint(again.unreadDots[0], fresh.frame.screenRect, SAFE_RANGES.sessionItem)
   }
 
   // 取一份足够新的识别结果；窗口尺寸变化或结果过旧时重新截图识别
@@ -467,9 +504,9 @@ export class Engine {
     if (cached && sameSize && !expectSearchResults && this.now() - cached.at < OBSERVATION_MAX_AGE_MS) {
       return cached
     }
-    const { frame } = await this.deps.capture(info, this.deps.settings().vision.maxImageSide)
+    const { frame, thumbnail } = await this.deps.capture(info, this.deps.settings().vision.maxImageSide)
     const observation = await this.deps.vision.observe(frame, { signal, expectSearchResults })
-    this.cached = { observation, frame, at: this.now() }
+    this.cached = { observation, frame, thumbnail, at: this.now() }
     return this.cached
   }
 
