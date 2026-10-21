@@ -5,6 +5,7 @@ import type {
   EnginePhase,
   EngineStatus,
   Frame,
+  NormBox,
   Observation,
   PendingReply,
   TargetWindow,
@@ -50,6 +51,8 @@ const MAX_QUEUED_TASKS = 100
 const OBSERVATION_MAX_AGE_MS = 20000
 const UNREAD_EMPTY_SWITCH_LIMIT = 3
 const UNREAD_COOLDOWN_MS = 60000
+const UNREAD_IGNORE_MS = 90000
+const UNREAD_ROW_HALF_HEIGHT = 40
 const MAX_PENDING_REPLIES = 20
 const MAX_RESPOND_FAILURES = 3
 const SESSION_LIST_CHANGE_RATIO = 0.01
@@ -95,6 +98,8 @@ export class Engine {
   private justSwitched = false
   private respondFailures = 0
   private unreadCooldownUntil = 0
+  private ignoredRows: { y: number; until: number }[] = []
+  private lastClickedY: number | null = null
 
   constructor(private readonly deps: EngineDeps) {}
 
@@ -151,6 +156,8 @@ export class Engine {
     this.emptySwitches = 0
     this.justSwitched = false
     this.unreadCooldownUntil = 0
+    this.ignoredRows = []
+    this.lastClickedY = null
     this.stopController = new AbortController()
     this.pauseController = new AbortController()
     this.setPhase('STARTING')
@@ -345,8 +352,10 @@ export class Engine {
     const before = this.tracker.snapshot(title)
     const firstSight = !this.tracker.has(title)
     const treatAllAsNew = this.treatNextAsNew && firstSight
-    const newMessages = this.tracker.update(title, observation.messages, treatAllAsNew)
-    this.treatNextAsNew = false
+    // 没有识别到任何消息的画面（如打开了不含聊天内容的页面）不更新追踪记录，避免清空该会话已见消息
+    const hasMessages = observation.messages.length > 0
+    const newMessages = hasMessages ? this.tracker.update(title, observation.messages, treatAllAsNew) : []
+    if (hasMessages) this.treatNextAsNew = false
     const hasPeerNew = newMessages.some((m) => m.role === 'peer')
     if (this.justSwitched) {
       this.justSwitched = false
@@ -378,7 +387,7 @@ export class Engine {
 
     // 当前会话处理完（回复、跳过或生成草稿）后继续看其他会话的未读，否则一个持续有新消息的会话会占满引擎
     if (outcome === 'sent') return settings.engine.afterReplyPollMs
-    if (observation.unreadDots.length > 0 && this.now() >= this.unreadCooldownUntil) {
+    if (this.pickUnreadDot(observation.unreadDots) && this.now() >= this.unreadCooldownUntil) {
       await this.switchToUnread(observation)
       return settings.engine.afterReplyPollMs
     }
@@ -392,6 +401,10 @@ export class Engine {
     if (hasPeerNew) {
       this.emptySwitches = 0
       return
+    }
+    // 点击的那一行没有带来新消息（如置顶会话的红点一直不消失），短时间内不再点这个位置
+    if (this.lastClickedY !== null) {
+      this.ignoredRows.push({ y: this.lastClickedY, until: this.now() + UNREAD_IGNORE_MS })
     }
     this.emptySwitches++
     if (this.emptySwitches >= UNREAD_EMPTY_SWITCH_LIMIT) {
@@ -427,6 +440,18 @@ export class Engine {
     return 'sent'
   }
 
+  // 取第一个不在“已忽略行”内的红点；红点的纵向位置用 0 到 1000 的归一化坐标比较
+  private pickUnreadDot(dots: NormBox[]): NormBox | null {
+    const now = this.now()
+    this.ignoredRows = this.ignoredRows.filter((row) => row.until > now)
+    return (
+      dots.find((dot) => {
+        const y = (dot[1] + dot[3]) / 2
+        return !this.ignoredRows.some((row) => Math.abs(row.y - y) <= UNREAD_ROW_HALF_HEIGHT)
+      }) ?? null
+    )
+  }
+
   private async switchToUnread(observation: Observation): Promise<void> {
     const settings = this.deps.settings()
     const target = this.target
@@ -437,6 +462,7 @@ export class Engine {
     await this.deps.windows.focus(target.hwnd)
     await this.deps.input.pause(150, 300, signal)
 
+    this.lastClickedY = null
     if (settings.engine.unreadSwitch === 'hotkey') {
       await this.deps.input.hotkey('g', ['control'], signal)
     } else {
@@ -473,17 +499,22 @@ export class Engine {
     const listBox = observation.sessionList ?? DEFAULT_SESSION_LIST
     const moved = changedFractionInBox(cached.thumbnail, fresh.thumbnail, listBox) > SESSION_LIST_CHANGE_RATIO
     if (!moved) {
-      return normBoxToScreenPoint(observation.unreadDots[0], fresh.frame.screenRect, SAFE_RANGES.sessionItem)
+      const dot = this.pickUnreadDot(observation.unreadDots)
+      if (!dot) return null
+      this.lastClickedY = (dot[1] + dot[3]) / 2
+      return normBoxToScreenPoint(dot, fresh.frame.screenRect, SAFE_RANGES.sessionItem)
     }
 
     logger.info('会话列表在识别之后发生了变化，重新识别后再点击')
     const again = await this.deps.vision.observe(fresh.frame, { signal })
     this.cached = { observation: again, frame: fresh.frame, thumbnail: fresh.thumbnail, at: this.now() }
-    if (again.unreadDots.length === 0) {
-      logger.info('重新识别后没有未读红点，放弃这次切换')
+    const dot = this.pickUnreadDot(again.unreadDots)
+    if (!dot) {
+      logger.info('重新识别后没有可点击的未读红点，放弃这次切换')
       return null
     }
-    return normBoxToScreenPoint(again.unreadDots[0], fresh.frame.screenRect, SAFE_RANGES.sessionItem)
+    this.lastClickedY = (dot[1] + dot[3]) / 2
+    return normBoxToScreenPoint(dot, fresh.frame.screenRect, SAFE_RANGES.sessionItem)
   }
 
   // 取一份足够新的识别结果；窗口尺寸变化或结果过旧时重新截图识别

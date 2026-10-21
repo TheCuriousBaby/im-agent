@@ -1,6 +1,7 @@
 // 输入后端：把键鼠原子操作交给 robotjs 子进程；其他后端（如外接硬件）实现同一接口即可替换。
 import { utilityProcess, type UtilityProcess } from 'electron'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { join, sep } from 'node:path'
 import type { Point } from '../../shared/types'
 import type { InputRequestBody, InputResponse, MouseButtonName } from './protocol'
 
@@ -22,6 +23,13 @@ interface Pending {
 
 const REQUEST_TIMEOUT_MS = 15000
 
+// 打包后输入子进程脚本被解包到 app.asar.unpacked 下，存在就优先用解包后的路径
+function workerPath(): string {
+  const inside = join(__dirname, 'inputWorker.js')
+  const unpacked = inside.replace(`app.asar${sep}`, `app.asar.unpacked${sep}`)
+  return unpacked !== inside && existsSync(unpacked) ? unpacked : inside
+}
+
 export class RobotInputBackend implements InputBackend {
   private child: UtilityProcess | null = null
   private nextId = 1
@@ -29,7 +37,7 @@ export class RobotInputBackend implements InputBackend {
 
   private ensureChild(): UtilityProcess {
     if (this.child) return this.child
-    const child = utilityProcess.fork(join(__dirname, 'inputWorker.js'), [], { serviceName: 'im-agent-input' })
+    const child = utilityProcess.fork(workerPath(), [], { serviceName: 'im-agent-input' })
     child.on('message', (response: InputResponse) => {
       const entry = this.pending.get(response.id)
       if (!entry) return

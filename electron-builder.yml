@@ -1,0 +1,38 @@
+# 安装包配置：Windows x64 的 NSIS 安装程序，产物输出到 release/。
+appId: com.im-agent.app
+productName: IM Agent
+copyright: Copyright © IM Agent
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**
+  - package.json
+
+# 输入子进程脚本及其依赖的 robotjs 原生模块（含运行时加载器 node-gyp-build）必须解包到 asar 外
+asarUnpack:
+  - out/main/inputWorker.js
+  - out/main/chunks/**
+  - node_modules/@hurdlegroup/robotjs/**
+  - node_modules/node-gyp-build/**
+
+# robotjs 自带 Windows 预编译，不需要在本机重新编译
+npmRebuild: false
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: IM Agent
+  artifactName: ${productName}-Setup-${version}.${ext}

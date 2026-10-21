@@ -21,3 +21,6 @@ logs/
 coverage/
 .DS_Store
 Thumbs.db
+
+# 安装包产物
+release/

@@ -346,6 +346,41 @@ test('当前会话持续有新消息但被跳过时，仍会切换到其他会�
   assert.equal(h.backend.calls.includes('key:enter'), false)
 })
 
+test('点击红点后没有新消息的行会被忽略，改点下一个红点', async () => {
+  const pinnedDot = box(0, 100, 280, 160)
+  const otherDot = box(0, 400, 280, 460)
+  const h = harness([], {
+    skip: true,
+    visionFn: (_call, index) => {
+      if (index === 0) return observation('置顶号', [msg('peer', '广告')], { unreadDots: [pinnedDot, otherDot] })
+      return observation('置顶号', [msg('peer', '广告')], { unreadDots: [pinnedDot, otherDot] })
+    }
+  })
+  h.engine.start(TARGET)
+  await waitFor(() => h.backend.calls.filter((c) => c === 'click').length >= 2)
+  h.engine.stop()
+  const moves = h.backend.calls.filter((c) => c.startsWith('move:')).map((c) => Number(c.split(',')[1]))
+  assert.ok(moves.length >= 2)
+  assert.ok(moves[moves.length - 1] > moves[0] + 100)
+})
+
+test('没有识别到任何消息的画面不会清空已见消息，也不会重复触发回复', async () => {
+  const dot = box(0, 100, 280, 160)
+  const h = harness([], {
+    skip: true,
+    visionFn: (_call, index) => {
+      if (index === 0) return observation('置顶号', [msg('peer', '广告')])
+      if (index === 1) return observation('置顶号', [msg('peer', '广告')], { unreadDots: [dot] })
+      if (index === 2) return observation('', [], { unreadDots: [dot] })
+      return observation('置顶号', [msg('peer', '广告')])
+    }
+  })
+  h.engine.start(TARGET)
+  await waitFor(() => h.visionCalls >= 5)
+  h.engine.stop()
+  assert.equal(h.decideCalls, 0)
+})
+
 test('多个会话的待确认回复分别保留，同一联系人只保留最新的草稿', async () => {
   const world = { title: 'Alice', messages: [msg('peer', 'hi')] }
   const h = harness([], { replyMode: 'confirm', reply: '草稿', visionFn: () => observation(world.title, world.messages) })

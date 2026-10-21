@@ -25,7 +25,7 @@
 
 ## 快速开始
 
-环境要求：Windows 10 或 11，Node 20.19 以上或 22.12 以上。目前通过源码运行，还没有安装包。
+环境要求：Windows 10 或 11，Node 20.19 以上或 22.12 以上。可以通过源码运行，也可以按下文打包成安装程序。
 
 ```bash
 npm install
@@ -41,6 +41,19 @@ npm test             # 单元测试与引擎集成测试
 ```
 
 Electron 二进制默认从国内镜像下载，地址写在 `.npmrc` 里。网络环境不需要的话可以删掉那一行。
+
+## 打包安装程序
+
+```bash
+npm run dist
+```
+
+产物在 `release/` 下：`IM Agent-Setup-0.1.0.exe`（Windows x64 的 NSIS 安装程序，可选安装目录，默认按当前用户安装，不需要管理员权限）。`npm run pack` 只生成未打包的目录 `release/win-unpacked/`，用来快速检查。
+
+- 打包配置在 `electron-builder.yml`，图标在 `build/`，其中 `icon.svg` 是源文件，`icon.ico` 由它生成。
+- 国内网络下载打包工具较慢或失败时，可以在命令前设置环境变量 `ELECTRON_MIRROR` 和 `ELECTRON_BUILDER_BINARIES_MIRROR` 指向镜像。
+- 安装包没有代码签名，Windows SmartScreen 首次运行时会提示“未知发布者”，选择“更多信息 → 仍要运行”即可。
+- 卸载程序不会删除用户数据（设置、画像、任务、日志都在 `%APPDATA%\im-agent`）。
 
 ## 首次使用
 
