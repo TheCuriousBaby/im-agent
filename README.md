@@ -23,7 +23,7 @@
 
 预留的扩展点与默认关闭的功能：
 
-- 硬件输入（仅接口）：键鼠操作抽象为 `InputBackend` 接口，目前只有基于 robotjs 的软件实现，可按同一接口接入外接 USB HID 设备（如串口转 HID 芯片或开发板），硬件后端本身尚未实现。
+- 硬件输入（已实现，未经真机验证）：键鼠操作抽象为 `InputBackend` 接口，除基于 robotjs 的软件实现外，还有通过串口驱动外接 USB HID 模组的硬件实现，软件模拟始终保留。输入方式在 设置 → 功能 → 引擎与输入 里选“自动 / 软件模拟 / 硬件 HID 模组”：自动模式识别到可用的模组就走硬件，否则走软件，识别不了时可以手动指定硬件。协议和模组侧 cyStudio 工程见 [docs/hid-module.md](docs/hid-module.md)。
 - 本机控制 API（已实现，默认关闭）：支持暂停、恢复、停止和入队发送任务。
 - 远程任务源（已实现客户端，默认关闭）：`TaskSource` 接口和一个 WebSocket 实现，没有配套的服务端。
 - 自定义视觉识别（仅接口）：`VisionProvider` 接口，可以换成自己的检测模型。
@@ -161,7 +161,7 @@ npm run dist
 
 ## 扩展点
 
-- 输入后端：实现 `src/main/executor/inputBackend.ts` 里的 `InputBackend`，可接入外接硬件等其他输入方式。
+- 输入后端：实现 `src/main/executor/inputBackend.ts` 里的 `InputBackend`，可接入其他输入方式。硬件 HID 后端在 `src/main/executor/hidBackend.ts`，串口链路在 `serialLink.ts`，由 `routingBackend.ts` 按设置路由。
 - 任务源：实现 `src/main/scheduler/taskSource.ts` 里的 `TaskSource`，通过 `TaskSink.submit` 下发任务，用 `report` 接收结果。`src/main/scheduler/remote/wsTaskSource.ts` 给出了一个 WebSocket 实现和协议，默认关闭。
 - 视觉识别：实现 `src/main/vision/vlmVision.ts` 里的 `VisionProvider`，可以换成自己的检测模型。
 
@@ -184,5 +184,5 @@ npm run dist
 - 识别准确度取决于所用的视觉模型。点击坐标来自模型返回的框，窗口布局特殊时可能点偏。
 - 目标窗口被其他窗口遮挡时，截到的是遮挡物，所以运行期间请保持目标窗口在最前且可见。
 - 切换未读时会点击所有带红点的会话，包括静音的群。
-- 外接硬件输入目前只有接口，没有实现。
+- 硬件 HID 后端只覆盖主屏，非字母数字文本仍通过剪贴板粘贴；模组侧工程需要自行在 cyStudio 里搭建。
 - 自动化操作聊天软件可能违反该软件的服务条款，请自行评估并承担风险。

@@ -17,6 +17,8 @@ asarUnpack:
   - out/main/chunks/**
   - node_modules/@hurdlegroup/robotjs/**
   - node_modules/node-gyp-build/**
+  # 硬件 HID 后端用到的串口原生模块
+  - node_modules/@serialport/bindings-cpp/**
 
 # robotjs 自带 Windows 预编译，不需要在本机重新编译
 npmRebuild: false

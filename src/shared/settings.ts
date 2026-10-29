@@ -62,7 +62,16 @@ export const SettingsSchema = z.object({
   input: z
     .object({
       humanize: z.boolean().default(true),
-      sendKeys: z.enum(['enter', 'ctrl-enter', 'compat']).default('enter')
+      sendKeys: z.enum(['enter', 'ctrl-enter', 'compat']).default('enter'),
+      // auto：识别到可用的硬件模组就走硬件，否则走软件模拟；software、hardware 为手动指定
+      backend: z.enum(['auto', 'software', 'hardware']).default('auto'),
+      hardware: z
+        .object({
+          // 串口号留空时按模组的 USB 标识自动查找
+          port: z.string().trim().default(''),
+          ack: z.boolean().default(true)
+        })
+        .prefault({})
     })
     .prefault({}),
   engine: z

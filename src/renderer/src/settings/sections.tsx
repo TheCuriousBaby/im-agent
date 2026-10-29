@@ -115,6 +115,37 @@ export function EngineSection(): React.JSX.Element {
         <h3>键鼠输入</h3>
         <div className="grid">
           <label className="field">
+            <span>输入方式</span>
+            <select
+              value={draft.input.backend}
+              onChange={(e) => patch({ input: { ...draft.input, backend: e.target.value as 'auto' | 'software' | 'hardware' } })}
+            >
+              <option value="auto">自动（识别到硬件模组走硬件，否则软件模拟）</option>
+              <option value="software">软件模拟（robotjs）</option>
+              <option value="hardware">硬件 HID 模组（手动指定）</option>
+            </select>
+          </label>
+          {draft.input.backend !== 'software' && (
+            <>
+              <label className="field">
+                <span>串口号（留空自动查找）</span>
+                <input
+                  value={draft.input.hardware.port}
+                  placeholder="例如 COM3"
+                  onChange={(e) => patch({ input: { ...draft.input, hardware: { ...draft.input.hardware, port: e.target.value } } })}
+                />
+              </label>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={draft.input.hardware.ack}
+                  onChange={(e) => patch({ input: { ...draft.input, hardware: { ...draft.input.hardware, ack: e.target.checked } } })}
+                />
+                <span>模组对每条指令回复 OK（需要模组程序里接好回执）</span>
+              </label>
+            </>
+          )}
+          <label className="field">
             <span>发送键</span>
             <select
               value={draft.input.sendKeys}

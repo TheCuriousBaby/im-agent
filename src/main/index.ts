@@ -1,5 +1,5 @@
 // 主进程入口：装配设置、模型、引擎、调度、窗口与本机 API，并把状态事件广播给所有窗口。
-import { app, clipboard, globalShortcut, nativeImage, session } from 'electron'
+import { app, clipboard, globalShortcut, nativeImage, screen, session } from 'electron'
 import { join } from 'node:path'
 import { EVENTS } from '../shared/ipc'
 import { toPublicSettings } from '../shared/settings'
@@ -11,8 +11,11 @@ import { ReplyBrain } from './brain/replyBrain'
 import { captureWindowFrame } from './capture/screenshot'
 import { focusWindow, getWindowInfo } from './capture/windowProbe'
 import { Engine } from './engine/engine'
+import { HidInputBackend } from './executor/hidBackend'
 import { RobotInputBackend } from './executor/inputBackend'
 import { InputController } from './executor/inputController'
+import { RoutingInputBackend } from './executor/routingBackend'
+import { findModulePort, openSerialLink } from './executor/serialLink'
 import { registerIpc } from './ipc/register'
 import { logger, onLog } from './logger'
 import { ProfileExtractor } from './profile/profileExtractor'
@@ -57,7 +60,27 @@ function bootstrap(): void {
   const windows = new WindowManager(rendererEntry)
   const target = new TargetSelection()
 
-  const backend = new RobotInputBackend()
+  const hid = new HidInputBackend({
+    connect: () => openSerialLink(settings.get().input.hardware.port),
+    // HID 绝对坐标只覆盖主屏；点位与光标都用屏幕物理像素，与截图坐标系一致
+    screen: () => screen.dipToScreenRect(null, screen.getPrimaryDisplay().bounds),
+    cursor: () => screen.dipToScreenPoint(screen.getCursorScreenPoint()),
+    ack: () => settings.get().input.hardware.ack
+  })
+  // 自动模式的探测：找到模组串口，并且模组里的程序对 ping 有回应
+  const probeHardware = async (): Promise<boolean> => {
+    try {
+      if (!settings.get().input.hardware.port.trim() && !(await findModulePort())) return false
+      await hid.ping()
+      return true
+    } catch {
+      return false
+    }
+  }
+  const backend = new RoutingInputBackend(new RobotInputBackend(), hid, () => settings.get().input.backend, {
+    probe: probeHardware,
+    onSwitch: (kind, reason) => logger.info(`键鼠输入切换为${kind === 'hardware' ? '硬件 HID 模组' : '软件模拟'}：${reason}`)
+  })
   const input = new InputController(
     backend,
     {
@@ -113,8 +136,21 @@ function bootstrap(): void {
 
   scheduler.start({ submit })
   applyConfig()
+  let hidPort = settings.get().input.hardware.port
+  let inputMode = settings.get().input.backend
   settings.onChange(() => {
     applyConfig()
+    const { port } = settings.get().input.hardware
+    const mode = settings.get().input.backend
+    const portChanged = port !== hidPort
+    if (portChanged) {
+      hidPort = port
+      hid.dispose()
+    }
+    if (portChanged || mode !== inputMode) {
+      inputMode = mode
+      backend.reset()
+    }
     windows.broadcast(EVENTS.settings, toPublicSettings(settings.get()))
   })
 
