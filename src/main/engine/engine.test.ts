@@ -451,16 +451,18 @@ test('画面完全不变且关闭兜底刷新时，只在启动时识别一次',
   assert.equal(h.visionCalls, 1)
 })
 
-test('识别失败后即使画面完全不变，也会在下一轮重新识别', async () => {
+test('识别失败后即使画面完全不变，也会在下一轮重新识别', async (t) => {
   const h = harness([observation('Alice', [msg('peer', 'hi')])], {
     staticFrames: true,
     idleRefreshMs: 0,
     failVisionTimes: 2
   })
+  t.after(() => {
+    h.engine.stop()
+  })
   h.engine.start(TARGET)
-  await waitFor(() => h.visionCalls >= 4)
-  h.engine.stop()
-  assert.equal(h.visionCalls >= 3, true)
+  await waitFor(() => h.visionCalls >= 3 && h.engine.status().lastError === null)
+  assert.equal(h.visionCalls, 3)
 })
 
 test('回复决策失败后，新消息不会被当作已处理，重试后仍能生成回复', async () => {

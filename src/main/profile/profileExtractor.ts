@@ -6,7 +6,7 @@ import type { ModelClient } from '../ai/modelClient'
 import { extractJson } from '../ai/jsonExtract'
 import { logger } from '../logger'
 import { formatConversation } from '../brain/replyBrain'
-import { applyUpdate, emptyProfile, PROFILE_LIMITS, renderProfileForPrompt, type ProfileStore } from './profileStore'
+import { applyUpdate, PROFILE_LIMITS, renderProfileForPrompt, type ProfileStore } from './profileStore'
 
 const UpdateSchema = z.object({
   tags: z.array(z.string()).catch([]),
@@ -28,13 +28,15 @@ interface Buffer {
   pending: number
 }
 
+const MAX_BUFFERED_MESSAGES = 60
+
 export class ProfileExtractor {
   private readonly buffers = new Map<string, Buffer>()
   private running = false
   private readonly queue: string[] = []
 
   constructor(
-    private readonly client: ModelClient,
+    private readonly client: Pick<ModelClient, 'ask'>,
     private readonly store: ProfileStore,
     private readonly settings: () => Settings,
     private readonly now: () => number = Date.now
@@ -50,7 +52,7 @@ export class ProfileExtractor {
     this.store.touch(contact, chatType, usable.length, this.now())
     const buffer = this.buffers.get(contact) ?? { chatType, messages: [], pending: 0 }
     buffer.chatType = chatType
-    buffer.messages = [...buffer.messages, ...usable].slice(-60)
+    buffer.messages = [...buffer.messages, ...usable].slice(-MAX_BUFFERED_MESSAGES)
     buffer.pending += usable.length
     this.buffers.set(contact, buffer)
 
@@ -69,10 +71,12 @@ export class ProfileExtractor {
         const buffer = this.buffers.get(contact)
         if (!buffer || buffer.pending === 0) continue
         const batch = buffer.messages
+        buffer.messages = []
         buffer.pending = 0
         try {
           await this.extract(contact, buffer.chatType, batch)
         } catch (error) {
+          buffer.messages = [...batch, ...buffer.messages].slice(-MAX_BUFFERED_MESSAGES)
           logger.warn(`画像抽取失败（${contact}）: ${(error as Error).message}`)
         }
       }
@@ -83,7 +87,8 @@ export class ProfileExtractor {
 
   private async extract(contact: string, chatType: 'single' | 'group', messages: ObservedMessage[]): Promise<void> {
     const settings = this.settings()
-    const profile = this.store.find(contact, chatType) ?? emptyProfile(contact, chatType, this.now())
+    const profile = this.store.find(contact, chatType)
+    if (!profile) return
     const user = [
       '现有画像：',
       renderProfileForPrompt(profile, settings.profileMemory.injectMaxChars),
@@ -93,7 +98,9 @@ export class ProfileExtractor {
     ].join('\n')
     const result = await this.client.ask({ role: 'profile', system: SYSTEM_PROMPT, user })
     const update = UpdateSchema.parse(extractJson(result.text))
-    this.store.upsert(applyUpdate(profile, update))
+    const current = this.store.find(contact, chatType)
+    if (!current) return
+    this.store.upsert(applyUpdate(current, update))
     logger.info(`已更新联系人画像：${contact}`)
   }
 }

@@ -59,13 +59,28 @@ test('单独配置了密钥时不被覆盖；画像沿用回复再沿用识别',
   assert.equal(resolveModelConfig({ vision, reply: null, profile: null }, 'profile').model, 'vl')
 })
 
-test('对界面暴露的设置不含密钥，只有是否已设置', () => {
-  const s = SettingsSchema.parse({ vision: { apiKey: 'secret', model: 'm' }, remote: { token: 'tok' } })
-  const json = JSON.stringify(toPublicSettings(s))
-  assert.ok(!json.includes('secret'))
-  assert.ok(!json.includes('tok'))
-  assert.equal(toPublicSettings(s).vision.apiKeySet, true)
-  assert.equal(toPublicSettings(s).remote.tokenSet, true)
+test('公开设置仅返回模型密钥和远程令牌的设置状态', () => {
+  const apiKey = 'fixture-model-api-key'
+  const token = 'fixture-remote-token'
+  const settings = SettingsSchema.parse({
+    vision: { apiKey },
+    reply: { apiKey },
+    profile: { apiKey },
+    remote: { token }
+  })
+  const publicSettings = toPublicSettings(settings)
+
+  for (const config of [publicSettings.vision, publicSettings.reply, publicSettings.profile]) {
+    assert.ok(config)
+    assert.equal(Object.hasOwn(config, 'apiKey'), false)
+    assert.equal(config.apiKeySet, true)
+  }
+  assert.equal(Object.hasOwn(publicSettings.remote, 'token'), false)
+  assert.equal(publicSettings.remote.tokenSet, true)
+
+  const json = JSON.stringify(publicSettings)
+  assert.ok(!json.includes(apiKey))
+  assert.ok(!json.includes(token))
 })
 
 test('端点、密钥、模型名两端的空白（如粘贴带入的制表符）会被去掉', () => {
