@@ -41,21 +41,25 @@ export class InputController {
     this.check(signal)
   }
 
-  async clickAt(point: Point, signal?: AbortSignal): Promise<void> {
+  async clickAt(point: Point, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void> {
     this.check(signal)
     await this.backend.moveTo(point, this.humanize())
     await this.pause(80, 200, signal)
+    if (guard) await guard()
+    this.check(signal)
     await this.backend.click('left')
     await this.pause(50, 150, signal)
   }
 
   // 把文本写入剪贴板并粘贴，结束后恢复原剪贴板内容
-  async paste(text: string, signal?: AbortSignal): Promise<void> {
+  async paste(text: string, signal?: AbortSignal, guard?: () => Promise<void>): Promise<void> {
     this.check(signal)
     const previous = this.clipboard.readText()
     try {
       this.clipboard.writeText(text)
       await this.pause(200, 300, signal)
+      if (guard) await guard()
+      this.check(signal)
       await this.backend.keyTap('v', ['control'])
       await this.pause(300, 500, signal)
     } finally {
@@ -77,18 +81,23 @@ export class InputController {
     }
   }
 
-  async sendKeys(mode: SendKeysMode, signal?: AbortSignal): Promise<void> {
-    this.check(signal)
+  async sendKeys(mode: SendKeysMode, signal?: AbortSignal, beforeKey?: () => Promise<void>): Promise<void> {
+    const tap = async (key: string, modifiers?: string[]): Promise<void> => {
+      this.check(signal)
+      if (beforeKey) await beforeKey()
+      this.check(signal)
+      await this.backend.keyTap(key, modifiers)
+    }
     if (mode === 'enter') {
-      await this.backend.keyTap('enter')
+      await tap('enter')
     } else if (mode === 'ctrl-enter') {
-      await this.backend.keyTap('enter', ['control'])
+      await tap('enter', ['control'])
     } else {
-      await this.backend.keyTap('enter')
+      await tap('enter')
       await this.pause(100, 140, signal)
-      await this.backend.keyTap('enter', ['control'])
+      await tap('enter', ['control'])
       await this.pause(50, 90, signal)
-      await this.backend.keyTap('backspace')
+      await tap('backspace')
     }
   }
 

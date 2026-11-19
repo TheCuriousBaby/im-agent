@@ -44,6 +44,8 @@ function observation(title: string, messages: ObservedMessage[], extra: Partial<
 
 class FakeBackend implements InputBackend {
   calls: string[] = []
+  onKeyTap?: (key: string) => void
+
   async moveTo(point: { x: number; y: number }): Promise<void> {
     this.calls.push(`move:${point.x},${point.y}`)
   }
@@ -52,6 +54,7 @@ class FakeBackend implements InputBackend {
   }
   async keyTap(key: string, modifiers: string[] = []): Promise<void> {
     this.calls.push(`key:${[...modifiers, key].join('+')}`)
+    this.onKeyTap?.(key)
   }
   async typeString(): Promise<void> {}
   async scroll(): Promise<void> {}
@@ -72,13 +75,14 @@ interface Harness {
 }
 
 // 与真实缩略图同尺寸的 BGRA 位图：右下角区域按 flip 交替，保证整帧检测能看到变化；会话列表区域随 listVersion 变化
-function makeThumbnail(flip: boolean, listVersion: number): Uint8Array {
+function makeThumbnail(flip: boolean, listVersion: number, chatVersion: number): Uint8Array {
   const data = new Uint8Array(THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4).fill(120)
   const paint = (x0: number, x1: number, y0: number, y1: number, value: number): void => {
     for (let y = y0; y < y1; y++) data.fill(value, (y * THUMBNAIL_WIDTH + x0) * 4, (y * THUMBNAIL_WIDTH + x1) * 4)
   }
-  if (flip) paint(100, THUMBNAIL_WIDTH, 96, THUMBNAIL_HEIGHT, 0)
+  if (flip) paint(100, THUMBNAIL_WIDTH, 108, THUMBNAIL_HEIGHT, 0)
   if (listVersion % 2 === 1) paint(0, 56, 10, 110, 30)
+  if (chatVersion % 2 === 1) paint(70, 170, 5, 65, 30)
   return data
 }
 
@@ -97,6 +101,9 @@ function harness(
     failDecideTimes?: number
     failVisionTimes?: number
     listState?: { version: number }
+    chatState?: { version: number }
+    foreground?: () => TargetWindow | null
+    onDecide?: () => void
     visionFn?: (call: VisionCall, index: number) => Observation
   } = {}
 ): Harness {
@@ -141,14 +148,22 @@ function harness(
         screenRect: { ...TARGET.rect },
         takenAt: 0
       },
-      thumbnail: makeThumbnail(!options.staticFrames && frameNo % 2 === 0, options.listState?.version ?? 0)
+      thumbnail: makeThumbnail(
+        !options.staticFrames && frameNo % 2 === 0,
+        options.listState?.version ?? 0,
+        options.chatState?.version ?? 0
+      )
     }
   }
 
   state.engine = new Engine({
     settings: () => settings,
     capture,
-    windows: { getInfo: async () => TARGET, focus: async () => true },
+    windows: {
+      getInfo: async () => TARGET,
+      focus: async () => true,
+      getForeground: async () => options.foreground ? options.foreground() : TARGET
+    },
     vision: {
       observe: async (_frame, observeOptions) => {
         const callIndex = state.visionCalls
@@ -163,6 +178,7 @@ function harness(
     brain: {
       decide: async () => {
         state.decideCalls++
+        options.onDecide?.()
         if (state.decideCalls <= (options.failDecideTimes ?? 0)) throw new Error('模型输出无法解析')
         if (options.skip) return { action: 'skip', text: '', reason: '群聊闲聊' }
         return { action: 'reply', text: options.reply ?? '收到，稍后回复你', reason: '' }
@@ -242,6 +258,64 @@ test('自动模式：新消息直接点击输入框、粘贴并发送', async ()
   assert.ok(h.backend.calls.includes('click'))
   const clickIndex = h.backend.calls.indexOf('click')
   assert.ok(h.backend.calls[clickIndex - 1].startsWith('move:'))
+})
+
+test('模型生成期间聊天画面变化，自动回复保留草稿且不点击或发送', async (t) => {
+  const chatState = { version: 0 }
+  const history = [msg('peer', '你好')]
+  const h = harness([observation('Alice', history), observation('Alice', [...history, msg('peer', '在吗')])], {
+    replyMode: 'auto', chatState, onDecide: () => { chatState.version++ }
+  })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingCount === 1)
+  assert.equal(h.engine.status().pendingReply?.contact, 'Alice')
+  assert.deepEqual(h.backend.calls, [])
+  assert.deepEqual(h.clipboardWrites, [])
+})
+
+test('粘贴后切换到其他窗口，不发发送键并保留草稿', async (t) => {
+  let foreground = TARGET
+  const history = [msg('peer', '你好')]
+  const h = harness([observation('Alice', history), observation('Alice', [...history, msg('peer', '在吗')])], {
+    replyMode: 'auto', foreground: () => foreground
+  })
+  h.backend.onKeyTap = (key) => { if (key === 'v') foreground = { ...TARGET, hwnd: '2' } }
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingCount === 1)
+  assert.ok(h.backend.calls.includes('key:control+v'))
+  assert.equal(h.backend.calls.includes('key:enter'), false)
+})
+
+test('发送键调用结果不确定时不重新生成或补发', async (t) => {
+  const history = [msg('peer', '你好')]
+  const h = harness([observation('Alice', history), observation('Alice', [...history, msg('peer', '在吗')])], { replyMode: 'auto' })
+  h.backend.onKeyTap = (key) => { if (key === 'enter') throw new Error('键盘后端超时') }
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.statuses.some((status) => status.lastError?.includes('发送结果不确定')))
+  const seen = h.visionCalls
+  await waitFor(() => h.visionCalls >= seen + 3)
+  assert.equal(h.decideCalls, 1)
+  assert.equal(h.backend.calls.filter((call) => call === 'key:enter').length, 1)
+  assert.equal(h.engine.status().pendingCount, 0)
+})
+
+test('原会话移出画面且连续生成失败超过三次，恢复后只创建原会话草稿', async (t) => {
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', '在吗')]),
+    observation('Bob', [msg('peer', '旧消息')])
+  ], { replyMode: 'auto', failDecideTimes: 4 })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingCount === 1)
+  assert.ok(h.visionCalls >= 3)
+  assert.equal(h.decideCalls, 5)
+  assert.equal(h.engine.status().pendingReply?.contact, 'Alice')
+  assert.deepEqual(h.backend.calls, [])
 })
 
 test('最后一条是自己发的消息时不回复', async () => {

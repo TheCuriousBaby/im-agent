@@ -8,14 +8,14 @@ export function ModelsSection(): React.JSX.Element {
   const { draft, patch, secrets, setSecret, saveAndTest, busy, results } = useSettingsContext()
 
   const toggleSeparate = (role: 'reply' | 'profile', on: boolean): void => {
-    if (on) patch({ [role]: { ...draft.vision, apiKeySet: false } })
-    else patch({ [role]: null })
+    const parent = role === 'profile' ? draft.reply ?? draft.vision : draft.vision
+    patch({ [role]: on ? { ...parent, baseUrl: '', apiKeySet: false } : null })
   }
 
   return (
     <div className="section">
       <p className="muted">
-        识别模型必须支持图片输入。回复与画像未单独配置时沿用识别模型。截图和对话内容只会发送到你在这里填写的端点。
+        识别模型必须支持图片输入。回复默认沿用识别模型，画像默认沿用回复模型。截图和对话内容只会发送到你在这里填写的端点。
       </p>
       <ModelForm
         title="识别模型（看截图）"

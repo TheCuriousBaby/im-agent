@@ -1,6 +1,6 @@
 // 模型客户端：按设置里的 OpenAI 兼容端点发起文本或图文调用，支持 responses 与 chat 两种协议。
 import OpenAI from 'openai'
-import type { ModelConfig } from '../../shared/settings'
+import { normalizeModelEndpoint, type ModelConfig } from '../../shared/settings'
 import type { ModelRole } from '../../shared/types'
 import { AbortedError } from '../abort'
 import { logger } from '../logger'
@@ -69,13 +69,8 @@ export function emptyOutputMessage(finishReason: string, outputTokens: number): 
   return `模型返回内容为空（finish_reason=${finishReason || '未知'}，输出 ${outputTokens} token）。推理模型可能把输出上限用在了思考上，可调大“最大输出 token”，或在“额外请求参数”里关闭思考`
 }
 
-function normalizeBaseUrl(raw: string): string {
-  const trimmed = raw.trim().replace(/\/+$/, '')
-  return trimmed
-}
-
 export function validateModelConfig(config: ModelConfig): string | null {
-  if (!config.baseUrl.trim()) return '未填写模型端点地址'
+  if (!normalizeModelEndpoint(config.baseUrl)) return '未填写模型端点地址'
   if (!config.apiKey.trim()) return '未填写模型密钥'
   if (!config.model.trim()) return '未填写模型名称'
   return null
@@ -93,7 +88,7 @@ export class ModelClient {
     if (problem) throw new Error(problem)
 
     const client = new OpenAI({
-      baseURL: normalizeBaseUrl(config.baseUrl),
+      baseURL: normalizeModelEndpoint(config.baseUrl),
       apiKey: config.apiKey,
       timeout: config.timeoutMs,
       maxRetries: 0

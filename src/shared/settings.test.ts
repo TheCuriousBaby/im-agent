@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   activeAgent,
+  bindModelKeys,
   DEFAULT_AGENT,
   defaultSettings,
   ModelConfigSchema,
@@ -57,6 +58,28 @@ test('单独配置了密钥时不被覆盖；画像沿用回复再沿用识别',
   assert.equal(resolved.baseUrl, 'https://v/v1')
   assert.equal(resolved.model, 'mini')
   assert.equal(resolveModelConfig({ vision, reply: null, profile: null }, 'profile').model, 'vl')
+})
+
+test('不同端点不能继承密钥，同一端点允许尾部斜杠差异', () => {
+  const vision = model({ baseUrl: 'https://vision.test/v1', apiKey: 'vision-fixture' })
+  const reply = model({ baseUrl: 'https://reply.test/v1' })
+  const profile = model({ baseUrl: vision.baseUrl })
+  assert.equal(resolveModelConfig({ vision, reply, profile }, 'reply').apiKey, '')
+  assert.equal(resolveModelConfig({ vision, reply, profile }, 'profile').apiKey, '')
+  assert.equal(resolveModelConfig({ vision, reply: model({ baseUrl: `${vision.baseUrl}/` }), profile: null }, 'reply').apiKey, vision.apiKey)
+})
+
+test('直接或间接更换端点时不搬迁原先的独立密钥', () => {
+  const vision = model({ baseUrl: 'https://vision.test/v1', apiKey: 'vision-fixture' })
+  const reply = model({ apiKey: 'reply-fixture' })
+  const previous = { vision, reply, profile: null }
+  const draft = { vision: { ...vision, apiKey: '' }, reply: { ...reply, apiKey: '' }, profile: null }
+  assert.equal(bindModelKeys(draft, previous).reply?.apiKey, reply.apiKey)
+  assert.throws(() => bindModelKeys({ ...draft, reply: { ...draft.reply, baseUrl: 'https://new.test/v1' } }, previous), /回复模型.*密钥/)
+  assert.throws(() => bindModelKeys({ ...draft, vision: model({ baseUrl: 'https://new.test/v1' }) }, previous), /识别模型.*密钥/)
+  const next = bindModelKeys({ ...draft, vision: model({ baseUrl: 'https://new.test/v1', apiKey: 'new-fixture' }) }, previous)
+  assert.equal(next.reply?.apiKey, '')
+  assert.equal(resolveModelConfig(next, 'reply').apiKey, 'new-fixture')
 })
 
 test('公开设置仅返回模型密钥和远程令牌的设置状态', () => {

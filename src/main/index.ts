@@ -9,7 +9,7 @@ import { UsageMeter } from './ai/usageMeter'
 import { LocalApi } from './api/localApi'
 import { ReplyBrain } from './brain/replyBrain'
 import { captureWindowFrame } from './capture/screenshot'
-import { focusWindow, getWindowInfo } from './capture/windowProbe'
+import { focusWindow, getForegroundWindow, getWindowInfo } from './capture/windowProbe'
 import { Engine } from './engine/engine'
 import { RobotInputBackend } from './executor/inputBackend'
 import { InputController } from './executor/inputController'
@@ -80,7 +80,7 @@ function bootstrap(): void {
   const engine = new Engine({
     settings: () => settings.get(),
     capture: captureWindowFrame,
-    windows: { getInfo: getWindowInfo, focus: focusWindow },
+    windows: { getInfo: getWindowInfo, focus: focusWindow, getForeground: getForegroundWindow },
     vision,
     brain,
     input,

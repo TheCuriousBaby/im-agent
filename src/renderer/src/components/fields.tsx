@@ -52,7 +52,7 @@ export function ModelForm(props: {
           <input value={value.baseUrl} onChange={(e) => onChange({ ...value, baseUrl: e.target.value })} />
         </label>
         <label className="field wide">
-          <span>密钥{value.apiKeySet ? '（已设置，留空保持不变）' : '（单独配置的回复、画像模型留空则沿用上一级）'}</span>
+          <span>密钥{value.apiKeySet ? '（端点不变时，留空保留原密钥）' : '（回复和画像仅在端点相同时可沿用上一级密钥）'}</span>
           <input
             type="password"
             autoComplete="off"

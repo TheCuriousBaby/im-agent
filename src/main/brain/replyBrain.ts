@@ -19,11 +19,10 @@ export interface ReplyDecision {
   reason: string
 }
 
-const DecisionSchema = z.object({
-  action: z.enum(['reply', 'skip']),
-  text: z.string().catch(''),
-  reason: z.string().catch('')
-})
+const DecisionSchema = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('reply'), text: z.string().trim().min(1), reason: z.string().catch('') }),
+  z.object({ action: z.literal('skip'), reason: z.string().catch('') })
+])
 
 const FORMAT_INSTRUCTION = [
   '只输出一个 JSON 对象，格式：{"action": "reply" 或 "skip", "text": 回复内容, "reason": 简短理由}。',
@@ -55,7 +54,7 @@ export function buildReplyUserPrompt(input: ReplyInput, settings: Settings): str
 
 export class ReplyBrain {
   constructor(
-    private readonly client: ModelClient,
+    private readonly client: Pick<ModelClient, 'ask'>,
     private readonly settings: () => Settings
   ) {}
 
@@ -73,8 +72,6 @@ export class ReplyBrain {
     } catch (error) {
       throw new Error(`${(error as Error).message}${describeOutput(result.text)}`)
     }
-    const text = decision.text.trim()
-    if (decision.action === 'reply' && !text) return { action: 'skip', text: '', reason: '模型未给出回复内容' }
-    return { action: decision.action, text: decision.action === 'reply' ? text : '', reason: decision.reason }
+    return { action: decision.action, text: decision.action === 'reply' ? decision.text : '', reason: decision.reason }
   }
 }

@@ -17,7 +17,7 @@ import type {
 import { normBoxToScreenPoint, SAFE_RANGES } from '../capture/coords'
 import { changedFractionInBox, hasFrameChanged } from '../capture/frameDiff'
 import type { CapturedFrame } from '../capture/screenshot'
-import { isAborted } from '../abort'
+import { AbortedError, isAborted } from '../abort'
 import type { InputController } from '../executor/inputController'
 import { logger } from '../logger'
 import type { ReplyBrain } from '../brain/replyBrain'
@@ -30,6 +30,7 @@ import { pickSearchResult, titleMatches } from './titleMatch'
 export interface WindowPort {
   getInfo(hwnd: string): Promise<TargetWindow | null>
   focus(hwnd: string): Promise<boolean>
+  getForeground(): Promise<TargetWindow | null>
 }
 
 export interface EngineDeps {
@@ -54,7 +55,7 @@ const UNREAD_COOLDOWN_MS = 60000
 const UNREAD_IGNORE_MS = 90000
 const UNREAD_ROW_HALF_HEIGHT = 40
 const MAX_PENDING_REPLIES = 20
-const MAX_RESPOND_FAILURES = 3
+const MAX_REPLY_RETRY_MS = 60000
 const SESSION_LIST_CHANGE_RATIO = 0.01
 const DEFAULT_SESSION_LIST: [number, number, number, number] = [0, 0, 350, 1000]
 
@@ -71,6 +72,18 @@ interface CachedObservation {
   frame: Frame
   thumbnail: Uint8Array
   at: number
+}
+
+interface ReplyAttempt {
+  item: Pick<OutboxItem, 'contact' | 'chatType'>
+  messages: Observation['messages']
+  retryAt: number
+  delayMs: number
+}
+
+interface SendGuard {
+  snapshot: CachedObservation
+  check: () => Promise<void>
 }
 
 export class Engine {
@@ -96,7 +109,7 @@ export class Engine {
   private currentTitle = ''
   private emptySwitches = 0
   private justSwitched = false
-  private respondFailures = 0
+  private readonly retryReplies = new Map<string, ReplyAttempt>()
   private unreadCooldownUntil = 0
   private ignoredRows: { y: number; until: number }[] = []
   private lastClickedY: number | null = null
@@ -146,6 +159,7 @@ export class Engine {
     this.lastError = null
     this.pendings = []
     this.outbox.length = 0
+    this.retryReplies.clear()
     this.tracker.clear()
     this.lastThumbnail = null
     this.cached = null
@@ -172,6 +186,7 @@ export class Engine {
     this.paused = false
     this.pendings = []
     this.outbox.length = 0
+    this.retryReplies.clear()
     this.stopController?.abort()
     this.pauseController.abort()
     this.setPhase('STOPPED')
@@ -271,12 +286,7 @@ export class Engine {
         }
         const item = this.outbox.shift()
         if (item !== undefined) {
-          try {
-            await this.sendText(item.text, item)
-          } catch (error) {
-            if (!isAborted(error)) this.addPending(item.contact, item.chatType, item.text)
-            throw error
-          }
+          await this.sendReply(item)
           delay = this.deps.settings().engine.afterReplyPollMs
         } else {
           const task = this.queue.shift()
@@ -284,11 +294,17 @@ export class Engine {
             await this.runTask(task)
             delay = this.deps.settings().engine.afterReplyPollMs
           } else {
-            delay = (await this.tick()) ?? delay
+            try {
+              delay = (await this.tick()) ?? delay
+            } finally {
+              if (!stopSignal.aborted && !this.paused) await this.retryOneReply()
+            }
           }
         }
+        if (stopSignal.aborted) return
         this.lastError = null
       } catch (error) {
+        if (stopSignal.aborted) return
         if (isAborted(error)) {
           if (this.paused) continue
         } else {
@@ -335,21 +351,22 @@ export class Engine {
       this.forceObserve = true
       throw error
     }
-    this.cached = { observation, frame, thumbnail, at: this.now() }
+    const snapshot = { observation, frame, thumbnail, at: this.now() }
+    this.cached = snapshot
     this.lastObservedAt = this.now()
     logger.info(
       `识别结果：会话「${observation.conversationTitle || '未识别'}」，消息 ${observation.messages.length} 条，未读红点 ${observation.unreadDots.length} 个，输入框${observation.inputArea ? '已识别' : '未识别'}`
     )
-    return this.handleObservation(observation)
+    return this.handleObservation(snapshot, info.hwnd)
   }
 
-  private async handleObservation(observation: Observation): Promise<number | undefined> {
+  private async handleObservation(snapshot: CachedObservation, hwnd: string): Promise<number | undefined> {
+    const { observation } = snapshot
     const settings = this.deps.settings()
     const title = observation.conversationTitle || this.currentTitle || '未命名会话'
     const chatType = observation.isGroup ? 'group' : 'single'
     this.currentTitle = title
 
-    const before = this.tracker.snapshot(title)
     const firstSight = !this.tracker.has(title)
     const treatAllAsNew = this.treatNextAsNew && firstSight
     // 没有识别到任何消息的画面（如打开了不含聊天内容的页面）不更新追踪记录，避免清空该会话已见消息
@@ -364,29 +381,23 @@ export class Engine {
 
     const spoken = observation.messages.filter((m) => m.role !== 'system')
     const last = spoken[spoken.length - 1]
+    const key = `${chatType}:${normalizeTitle(title)}`
     let outcome: RespondOutcome = 'none'
-    if (hasPeerNew && last?.role === 'peer') {
-      try {
-        outcome = await this.respond(title, observation)
-        this.respondFailures = 0
-      } catch (error) {
-        // 回复没有处理成功，把这批消息退回成“未见过”，下一轮重新处理；连续失败多次才放弃
-        this.respondFailures++
-        if (isAborted(error) || this.respondFailures < MAX_RESPOND_FAILURES) {
-          this.tracker.restore(title, before)
-          this.treatNextAsNew = this.treatNextAsNew || treatAllAsNew
-          this.forceObserve = true
-        } else {
-          this.respondFailures = 0
-          logger.warn(`「${title}」的回复连续失败，放弃这批消息`)
-        }
-        throw error
+    if (newMessages.length > 0) this.deps.extractor.ingest(title, chatType, newMessages)
+    if (last?.role === 'self' && observation.conversationTitle && newMessages.includes(last)) {
+      this.retryReplies.delete(key)
+    } else if (hasPeerNew && last?.role === 'peer') {
+      const waiting = this.retryReplies.get(key)
+      if (waiting) {
+        if (observation.conversationTitle) waiting.messages = observation.messages
+      } else {
+        const attempt = { item: { contact: title, chatType }, messages: observation.messages, retryAt: 0, delayMs: 0 }
+        this.retryReplies.set(key, attempt)
+        outcome = await this.respond(key, attempt, { snapshot, hwnd })
       }
     }
-    if (newMessages.length > 0) this.deps.extractor.ingest(title, chatType, newMessages)
 
-    // 当前会话处理完（回复、跳过或生成草稿）后继续看其他会话的未读，否则一个持续有新消息的会话会占满引擎
-    if (outcome === 'sent') return settings.engine.afterReplyPollMs
+    if (outcome === 'sent' || this.forceObserve) return settings.engine.afterReplyPollMs
     if (this.pickUnreadDot(observation.unreadDots) && this.now() >= this.unreadCooldownUntil) {
       await this.switchToUnread(observation)
       return settings.engine.afterReplyPollMs
@@ -414,30 +425,48 @@ export class Engine {
     }
   }
 
-  private async respond(title: string, observation: Observation): Promise<RespondOutcome> {
-    const settings = this.deps.settings()
-    const chatType = observation.isGroup ? 'group' : 'single'
-    const decision = await this.deps.brain.decide(
-      {
-        contact: title,
-        isGroup: observation.isGroup,
-        messages: observation.messages,
-        profile: this.deps.profiles.find(title, chatType)
-      },
-      this.opSignal()
-    )
+  private async retryOneReply(): Promise<void> {
+    const now = this.now()
+    let due: [string, ReplyAttempt] | undefined
+    for (const entry of this.retryReplies) {
+      if (entry[1].retryAt <= now && (!due || entry[1].retryAt < due[1].retryAt)) due = entry
+    }
+    if (!due) return
+    this.setPhase('RESPONDING')
+    await this.respond(...due)
+    if (this.running && !this.paused) this.setPhase('POLLING')
+  }
+
+  private async respond(key: string, attempt: ReplyAttempt, source?: { snapshot: CachedObservation; hwnd: string }): Promise<RespondOutcome> {
+    const { contact, chatType } = attempt.item
+    const signal = this.opSignal()
+    let decision: Awaited<ReturnType<ReplyBrain['decide']>>
+    try {
+      decision = await this.deps.brain.decide({
+        contact,
+        isGroup: chatType === 'group',
+        messages: attempt.messages,
+        profile: this.deps.profiles.find(contact, chatType)
+      }, signal)
+    } catch (error) {
+      if (signal.aborted || isAborted(error)) return 'none'
+      const minimum = this.deps.errorBackoffMs ?? 3000
+      attempt.delayMs = Math.min(MAX_REPLY_RETRY_MS, Math.max(minimum, attempt.delayMs * 2))
+      attempt.retryAt = this.now() + attempt.delayMs
+      logger.warn(`「${contact}」的回复生成失败，将重试：${(error as Error).message}`)
+      return 'none'
+    }
+    if (signal.aborted) return 'none'
+    this.retryReplies.delete(key)
     if (decision.action === 'skip') {
-      logger.info(`跳过回复「${title}」：${decision.reason || '无需回复'}`)
+      logger.info(`跳过回复「${contact}」：${decision.reason || '无需回复'}`)
       return 'skipped'
     }
-    if (settings.engine.replyMode === 'confirm') {
-      this.addPending(title, chatType, decision.text)
-      logger.info(`已生成待确认回复「${title}」（${decision.text.length} 字）`)
+    if (!source || this.deps.settings().engine.replyMode === 'confirm') {
+      this.addPending(contact, chatType, decision.text)
       return 'pending'
     }
-    logger.info(`自动回复「${title}」（${decision.text.length} 字）`)
-    await this.sendText(decision.text)
-    return 'sent'
+    return this.sendReply({ contact, chatType, text: decision.text }, source)
   }
 
   // 取第一个不在“已忽略行”内的红点；红点的纵向位置用 0 到 1000 的归一化坐标比较
@@ -547,25 +576,89 @@ export class Engine {
     await this.deps.input.pause(200, 350, signal)
   }
 
-  // contact 不为空时先确认当前打开的就是该会话，不是就通过搜索切过去，避免草稿发到别的会话
-  private async sendText(text: string, contact?: { contact: string }): Promise<void> {
-    this.setPhase('EXECUTING')
-    const signal = this.opSignal()
-    await this.focusTarget(signal)
-    if (contact) await this.openConversation(contact.contact, signal)
-    await this.typeIntoInput(signal, async () => this.deps.input.paste(text, signal))
-    this.afterSend()
+  // 复核触发回复时的窗口与聊天画面，画面不一致时保留草稿。
+  private autoSendGuard(snapshot: CachedObservation, hwnd: string, signal: AbortSignal): SendGuard {
+    const { observation, frame, thumbnail } = snapshot
+    const { chatArea, inputArea, conversationTitle } = observation
+    if (!conversationTitle.trim() || !chatArea || !inputArea || chatArea[2] <= chatArea[0] ||
+        chatArea[3] <= chatArea[1] || inputArea[1] <= chatArea[1] || inputArea[2] <= inputArea[0] || inputArea[3] <= inputArea[1]) {
+      throw new Error('无法定位自动回复的原会话、消息区或输入框')
+    }
+    const chatAndTitle: NormBox = [chatArea[0], 0, chatArea[2], Math.min(chatArea[3], inputArea[1])]
+    const rect = frame.screenRect
+    const sameRect = (other: TargetWindow['rect']): boolean =>
+      other.x === rect.x && other.y === rect.y && other.width === rect.width && other.height === rect.height
+    return {
+      snapshot,
+      check: async () => {
+        if (signal.aborted) throw new AbortedError()
+        const current = await this.deps.windows.getForeground()
+        if (signal.aborted) throw new AbortedError()
+        if (!current || current.hwnd !== hwnd || this.target?.hwnd !== hwnd || !sameRect(current.rect)) {
+          throw new Error('自动回复的原窗口不在前台或位置已变化')
+        }
+        const fresh = await this.deps.capture(current, this.deps.settings().vision.maxImageSide)
+        if (signal.aborted) throw new AbortedError()
+        if (!sameRect(fresh.frame.screenRect) || changedFractionInBox(thumbnail, fresh.thumbnail, chatAndTitle) > 0) {
+          throw new Error('当前聊天画面与生成回复时不一致')
+        }
+      }
+    }
   }
 
-  private async typeIntoInput(signal: AbortSignal, fill: () => Promise<void>): Promise<void> {
-    const { observation, frame } = await this.freshObservation(signal)
+  private async sendReply(item: OutboxItem, source?: { snapshot: CachedObservation; hwnd: string }): Promise<'sent' | 'pending'> {
+    this.setPhase('EXECUTING')
+    const stopSignal = this.stopController?.signal
+    const signal = this.opSignal()
+    let pasted = false
+    let attempted = false
+    let keysDone = false
+    try {
+      const guard = source ? this.autoSendGuard(source.snapshot, source.hwnd, signal) : undefined
+      if (guard) {
+        await guard.check()
+      } else {
+        await this.focusTarget(signal)
+        await this.openConversation(item.contact, signal)
+      }
+      await this.typeIntoInput(signal, () => this.deps.input.paste(item.text, signal, guard && (async () => {
+        await guard.check()
+        if (signal.aborted) throw new AbortedError()
+        pasted = true
+      })), guard, async () => {
+        if (guard) await guard.check()
+        if (signal.aborted) throw new AbortedError()
+        attempted = true
+      })
+      keysDone = true
+      await this.deps.input.pause(500, 800, signal)
+      return 'sent'
+    } catch (error) {
+      if (stopSignal?.aborted) throw error
+      if (!attempted) {
+        this.addPending(item.contact, item.chatType, item.text)
+        if (source) {
+          logger.warn(`自动回复已保留为待确认草稿：${(error as Error).message}${pasted ? '；文本可能留在输入框' : ''}`)
+          return 'pending'
+        }
+        throw error
+      }
+      if (keysDone && isAborted(error)) return 'sent'
+      throw new Error(`「${item.contact}」的发送结果不确定，请先核对聊天记录`)
+    } finally {
+      if (!stopSignal?.aborted) this.afterSend()
+    }
+  }
+
+  private async typeIntoInput(signal: AbortSignal, fill: () => Promise<void>, guard?: SendGuard, beforeKey?: () => Promise<void>): Promise<void> {
+    const { observation, frame } = guard?.snapshot ?? await this.freshObservation(signal)
     if (!observation.inputArea) throw new Error('未识别到消息输入框')
     const point = normBoxToScreenPoint(observation.inputArea, frame.screenRect, SAFE_RANGES.messageInput)
-    await this.deps.input.clickAt(point, signal)
+    await this.deps.input.clickAt(point, signal, guard?.check)
     await fill()
     await this.deps.input.pause(250, 400, signal)
-    await this.deps.input.sendKeys(this.deps.settings().input.sendKeys, signal)
-    await this.deps.input.pause(500, 800, signal)
+    await this.deps.input.sendKeys(this.deps.settings().input.sendKeys, signal, beforeKey)
+    if (!beforeKey) await this.deps.input.pause(500, 800, signal)
   }
 
   private afterSend(): void {

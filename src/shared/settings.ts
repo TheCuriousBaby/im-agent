@@ -127,23 +127,41 @@ export function speedOf(engine: Pick<Settings['engine'], 'pollIntervalMs' | 'aft
   return key ?? 'custom'
 }
 
-// 单独配置的模型没填端点或密钥时沿用上一级（回复沿用识别，画像沿用回复）的对应项，方便只换模型名
-export function resolveModelConfig(
-  settings: Pick<Settings, 'vision' | 'reply' | 'profile'>,
-  role: 'vision' | 'reply' | 'profile'
-): ModelConfig {
-  const { vision, reply, profile } = settings
-  const inherit = (own: ModelConfig, parent: ModelConfig): ModelConfig => ({
-    ...own,
-    baseUrl: own.baseUrl || parent.baseUrl,
-    apiKey: own.apiKey || parent.apiKey
-  })
-  if (role === 'reply') return reply ? inherit(reply, vision) : vision
-  if (role === 'profile') {
-    const parent = reply ? inherit(reply, vision) : vision
-    return profile ? inherit(profile, parent) : parent
+type ModelSettings = Pick<Settings, 'vision' | 'reply' | 'profile'>
+type ModelRole = keyof ModelSettings
+
+export function normalizeModelEndpoint(endpoint: string): string {
+  return endpoint.trim().replace(/\/+$/, '')
+}
+
+// 回复和画像可沿用上一级端点；仅同一端点可以沿用密钥。
+export function resolveModelConfig(settings: ModelSettings, role: ModelRole): ModelConfig {
+  if (role === 'vision') return settings.vision
+  const parent = resolveModelConfig(settings, role === 'reply' ? 'vision' : 'reply')
+  const own = settings[role]
+  if (!own) return parent
+  const baseUrl = own.baseUrl || parent.baseUrl
+  const endpoint = normalizeModelEndpoint(baseUrl)
+  const sameEndpoint = endpoint && endpoint === normalizeModelEndpoint(parent.baseUrl)
+  return { ...own, baseUrl, apiKey: own.apiKey || (sameEndpoint ? parent.apiKey : '') }
+}
+
+// 将保留的密钥绑定到各模型的生效端点，并校验端点变更。
+export function bindModelKeys(draft: ModelSettings, previous: ModelSettings): ModelSettings {
+  const next = { vision: { ...draft.vision }, reply: draft.reply && { ...draft.reply }, profile: draft.profile && { ...draft.profile } }
+  const labels = { vision: '识别模型', reply: '回复模型', profile: '画像模型' }
+  for (const role of ['vision', 'reply', 'profile'] as const) {
+    const own = next[role]
+    if (!own) continue
+    const old = resolveModelConfig(previous, role)
+    const endpoint = normalizeModelEndpoint(resolveModelConfig(next, role).baseUrl)
+    const changed = endpoint !== normalizeModelEndpoint(old.baseUrl)
+    if (!changed && !own.apiKey) own.apiKey = previous[role]?.apiKey ?? ''
+    if (endpoint && !resolveModelConfig(next, role).apiKey && (changed || old.apiKey)) {
+      throw new Error(`${labels[role]}：请填写当前端点的密钥`)
+    }
   }
-  return vision
+  return next
 }
 
 // 主面板上可直接调整的引擎项
@@ -159,7 +177,7 @@ export type PublicSettings = Omit<Settings, 'vision' | 'reply' | 'profile' | 're
   remote: Omit<Settings['remote'], 'token'> & { tokenSet: boolean }
 }
 
-// 保存设置时的输入：密钥与令牌留空表示保持原值
+// 保存设置时的输入：模型密钥按生效端点保留，令牌留空保留原值。
 export type SettingsInput = Settings
 
 export function defaultSettings(): Settings {
