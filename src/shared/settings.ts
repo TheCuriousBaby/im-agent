@@ -127,23 +127,49 @@ export function speedOf(engine: Pick<Settings['engine'], 'pollIntervalMs' | 'aft
   return key ?? 'custom'
 }
 
-// 单独配置的模型没填端点或密钥时沿用上一级（回复沿用识别，画像沿用回复）的对应项，方便只换模型名
-export function resolveModelConfig(
-  settings: Pick<Settings, 'vision' | 'reply' | 'profile'>,
-  role: 'vision' | 'reply' | 'profile'
-): ModelConfig {
+type ModelSettings = Pick<Settings, 'vision' | 'reply' | 'profile'>
+
+export function normalizeModelEndpoint(raw: string): string {
+  return raw.trim().replace(/\/+$/, '')
+}
+
+// 回复沿用识别端点，画像沿用回复端点；密钥只在使用同一端点时沿用。
+export function resolveModelConfig(settings: ModelSettings, role: keyof ModelSettings): ModelConfig {
   const { vision, reply, profile } = settings
-  const inherit = (own: ModelConfig, parent: ModelConfig): ModelConfig => ({
-    ...own,
-    baseUrl: own.baseUrl || parent.baseUrl,
-    apiKey: own.apiKey || parent.apiKey
-  })
-  if (role === 'reply') return reply ? inherit(reply, vision) : vision
-  if (role === 'profile') {
-    const parent = reply ? inherit(reply, vision) : vision
-    return profile ? inherit(profile, parent) : parent
+  const inherit = (own: ModelConfig, parent: ModelConfig): ModelConfig => {
+    const baseUrl = own.baseUrl || parent.baseUrl
+    const endpoint = normalizeModelEndpoint(baseUrl)
+    const sharesEndpoint = endpoint !== '' && endpoint === normalizeModelEndpoint(parent.baseUrl)
+    return { ...own, baseUrl, apiKey: own.apiKey || (sharesEndpoint ? parent.apiKey : '') }
   }
-  return vision
+  if (role === 'vision') return vision
+  const resolvedReply = reply ? inherit(reply, vision) : vision
+  if (role === 'reply') return resolvedReply
+  return profile ? inherit(profile, resolvedReply) : resolvedReply
+}
+
+const MODEL_LABELS = { vision: '识别模型', reply: '回复模型', profile: '画像模型' } as const
+
+// 按生效端点保留已保存的密钥；变更端点时校验各角色能否取得对应密钥。
+export function bindModelKeys(draft: ModelSettings, previous: ModelSettings): ModelSettings {
+  const next = { vision: draft.vision, reply: draft.reply, profile: draft.profile }
+  for (const role of ['vision', 'reply', 'profile'] as const) {
+    const own = draft[role]
+    if (!own) continue
+
+    const before = resolveModelConfig(previous, role)
+    const endpoint = normalizeModelEndpoint(resolveModelConfig(next, role).baseUrl)
+    const changed = endpoint !== normalizeModelEndpoint(before.baseUrl)
+    const previousKey = previous[role]?.apiKey ?? ''
+    const missingKey = (): Error => new Error(`${MODEL_LABELS[role]}：请填写当前端点对应的密钥`)
+    if (endpoint && changed && previousKey && !own.apiKey) throw missingKey()
+
+    next[role] = { ...own, apiKey: own.apiKey || (changed ? '' : previousKey) }
+    if (endpoint && !resolveModelConfig(next, role).apiKey && (changed || before.apiKey || !previous[role])) {
+      throw missingKey()
+    }
+  }
+  return next
 }
 
 // 主面板上可直接调整的引擎项
@@ -159,7 +185,7 @@ export type PublicSettings = Omit<Settings, 'vision' | 'reply' | 'profile' | 're
   remote: Omit<Settings['remote'], 'token'> & { tokenSet: boolean }
 }
 
-// 保存设置时的输入：密钥与令牌留空表示保持原值
+// 保存设置时的输入：模型密钥按端点保留，远程令牌留空保留原值。
 export type SettingsInput = Settings
 
 export function defaultSettings(): Settings {
@@ -183,7 +209,7 @@ export function toPublicSettings(s: Settings): PublicSettings {
   }
 }
 
-// 把脱敏设置还原成保存输入，密钥与令牌置空表示保持原值
+// 把脱敏设置还原成保存输入，未提供的新密钥和令牌以空串表示。
 export function publicToInput(p: PublicSettings): SettingsInput {
   const toModel = (m: PublicModelConfig): ModelConfig => {
     const { apiKeySet: _ignored, ...rest } = m

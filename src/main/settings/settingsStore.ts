@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path'
 import {
   activeAgent,
+  bindModelKeys,
   resolveModelConfig,
   SettingsSchema,
   toPublicSettings,
@@ -99,19 +100,15 @@ export class SettingsStore {
     return toPublicSettings(this.current)
   }
 
-  // 指定角色的模型配置；reply 与 profile 未单独配置时沿用 vision
   resolveModel(role: ModelRole): ModelConfig {
     return resolveModelConfig(this.current, role)
   }
 
   save(input: SettingsInput): PublicSettings {
-    const next = SettingsSchema.parse(input)
+    const draft = SettingsSchema.parse(input)
     const prev = this.current
-    const keep = (incoming: string, previous: string | undefined): string =>
-      incoming === '' ? (previous ?? '') : incoming
-    next.vision.apiKey = keep(next.vision.apiKey, prev.vision.apiKey)
-    if (next.reply) next.reply.apiKey = keep(next.reply.apiKey, prev.reply?.apiKey)
-    if (next.profile) next.profile.apiKey = keep(next.profile.apiKey, prev.profile?.apiKey)
+    const next = { ...draft, ...bindModelKeys(draft, prev) }
+    const keep = (incoming: string, previous: string): string => incoming || previous
     next.remote.token = keep(next.remote.token, prev.remote.token)
     const chosen = activeAgent(next)
     next.agents = next.agents.map((a) => ({ ...a, enabled: next.agents.some((x) => x.enabled) ? a.id === chosen.id : false }))

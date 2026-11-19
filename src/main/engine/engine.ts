@@ -17,19 +17,20 @@ import type {
 import { normBoxToScreenPoint, SAFE_RANGES } from '../capture/coords'
 import { changedFractionInBox, hasFrameChanged } from '../capture/frameDiff'
 import type { CapturedFrame } from '../capture/screenshot'
-import { isAborted } from '../abort'
+import { AbortedError, isAborted } from '../abort'
 import type { InputController } from '../executor/inputController'
 import { logger } from '../logger'
 import type { ReplyBrain } from '../brain/replyBrain'
 import type { ProfileExtractor } from '../profile/profileExtractor'
 import type { ProfileStore } from '../profile/profileStore'
 import type { VisionProvider } from '../vision/vlmVision'
-import { MessageTracker, normalizeTitle } from './messageTracker'
+import { MessageTracker, messageKey, normalizeTitle } from './messageTracker'
 import { pickSearchResult, titleMatches } from './titleMatch'
 
 export interface WindowPort {
   getInfo(hwnd: string): Promise<TargetWindow | null>
   focus(hwnd: string): Promise<boolean>
+  getForeground(): Promise<TargetWindow | null>
 }
 
 export interface EngineDeps {
@@ -54,7 +55,7 @@ const UNREAD_COOLDOWN_MS = 60000
 const UNREAD_IGNORE_MS = 90000
 const UNREAD_ROW_HALF_HEIGHT = 40
 const MAX_PENDING_REPLIES = 20
-const MAX_RESPOND_FAILURES = 3
+const REPLY_RETRY_MAX_DELAY_MS = 60000
 const SESSION_LIST_CHANGE_RATIO = 0.01
 const DEFAULT_SESSION_LIST: [number, number, number, number] = [0, 0, 350, 1000]
 
@@ -64,6 +65,26 @@ interface OutboxItem {
   chatType: 'single' | 'group'
 }
 
+interface AutoReplySource {
+  hwnd: string
+  title: string
+  messages: Observation['messages']
+}
+
+interface ReplyWork {
+  key: string
+  contact: string
+  chatType: 'single' | 'group'
+  source: AutoReplySource
+  retryDelayMs: number
+  retryAt: number
+}
+
+interface SendProgress {
+  attempted: boolean
+  keysReturned: boolean
+}
+
 type RespondOutcome = 'none' | 'skipped' | 'pending' | 'sent'
 
 interface CachedObservation {
@@ -71,6 +92,26 @@ interface CachedObservation {
   frame: Frame
   thumbnail: Uint8Array
   at: number
+}
+
+interface AutoReplyGuard {
+  verified: { frame: Frame; inputArea: NormBox }
+  check: () => Promise<void>
+}
+
+function sameRect(a: TargetWindow['rect'], b: TargetWindow['rect']): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+}
+
+function autoReplyTitle(title: string, isGroup: boolean): string {
+  const trimmed = title.trim()
+  return isGroup ? trimmed.replace(/\s*[（(]\d+[）)]$/, '').trim() : trimmed
+}
+
+function replyAnchor(messages: Observation['messages']): string[] {
+  const recent = messages.filter((message) => message.role !== 'system').slice(-2)
+  const last = recent[recent.length - 1]
+  return last?.role === 'peer' && last.text.trim() ? recent.map(messageKey) : []
 }
 
 export class Engine {
@@ -87,6 +128,7 @@ export class Engine {
 
   private readonly queue: TaskMessage[] = []
   private readonly outbox: OutboxItem[] = []
+  private readonly replyWork = new Map<string, ReplyWork>()
   private readonly tracker = new MessageTracker()
   private lastThumbnail: Uint8Array | null = null
   private cached: CachedObservation | null = null
@@ -96,7 +138,6 @@ export class Engine {
   private currentTitle = ''
   private emptySwitches = 0
   private justSwitched = false
-  private respondFailures = 0
   private unreadCooldownUntil = 0
   private ignoredRows: { y: number; until: number }[] = []
   private lastClickedY: number | null = null
@@ -146,6 +187,7 @@ export class Engine {
     this.lastError = null
     this.pendings = []
     this.outbox.length = 0
+    this.replyWork.clear()
     this.tracker.clear()
     this.lastThumbnail = null
     this.cached = null
@@ -172,6 +214,7 @@ export class Engine {
     this.paused = false
     this.pendings = []
     this.outbox.length = 0
+    this.replyWork.clear()
     this.stopController?.abort()
     this.pauseController.abort()
     this.setPhase('STOPPED')
@@ -271,12 +314,7 @@ export class Engine {
         }
         const item = this.outbox.shift()
         if (item !== undefined) {
-          try {
-            await this.sendText(item.text, item)
-          } catch (error) {
-            if (!isAborted(error)) this.addPending(item.contact, item.chatType, item.text)
-            throw error
-          }
+          await this.sendReply(item)
           delay = this.deps.settings().engine.afterReplyPollMs
         } else {
           const task = this.queue.shift()
@@ -284,11 +322,13 @@ export class Engine {
             await this.runTask(task)
             delay = this.deps.settings().engine.afterReplyPollMs
           } else {
-            delay = (await this.tick()) ?? delay
+            delay = (await this.tickAndRetry(stopSignal)) ?? delay
           }
         }
+        if (stopSignal.aborted) return
         this.lastError = null
       } catch (error) {
+        if (stopSignal.aborted) return
         if (isAborted(error)) {
           if (this.paused) continue
         } else {
@@ -301,6 +341,26 @@ export class Engine {
       }
       await this.wait(delay, stopSignal)
     }
+  }
+
+  private async tickAndRetry(stopSignal: AbortSignal): Promise<number | undefined> {
+    let delay: number | undefined
+    let tickFailure: { error: unknown } | undefined
+    try {
+      delay = await this.tick()
+    } catch (error) {
+      tickFailure = { error }
+    }
+    if (!stopSignal.aborted && !this.paused) {
+      try {
+        await this.retryReply()
+      } catch (error) {
+        if (!tickFailure) throw error
+        if (!isAborted(error)) logger.warn(`回复重试失败：${(error as Error).message}`)
+      }
+    }
+    if (tickFailure) throw tickFailure.error
+    return delay
   }
 
   // 一轮监控：截图，界面有变化才调用视觉模型；返回下一轮等待时长，undefined 表示用默认值
@@ -340,16 +400,15 @@ export class Engine {
     logger.info(
       `识别结果：会话「${observation.conversationTitle || '未识别'}」，消息 ${observation.messages.length} 条，未读红点 ${observation.unreadDots.length} 个，输入框${observation.inputArea ? '已识别' : '未识别'}`
     )
-    return this.handleObservation(observation)
+    return this.handleObservation(observation, info.hwnd)
   }
 
-  private async handleObservation(observation: Observation): Promise<number | undefined> {
+  private async handleObservation(observation: Observation, hwnd: string): Promise<number | undefined> {
     const settings = this.deps.settings()
     const title = observation.conversationTitle || this.currentTitle || '未命名会话'
     const chatType = observation.isGroup ? 'group' : 'single'
     this.currentTitle = title
 
-    const before = this.tracker.snapshot(title)
     const firstSight = !this.tracker.has(title)
     const treatAllAsNew = this.treatNextAsNew && firstSight
     // 没有识别到任何消息的画面（如打开了不含聊天内容的页面）不更新追踪记录，避免清空该会话已见消息
@@ -362,28 +421,24 @@ export class Engine {
       this.recordSwitchOutcome(hasPeerNew)
     }
 
-    const spoken = observation.messages.filter((m) => m.role !== 'system')
+    const spoken = observation.messages.filter((message) => message.role !== 'system')
     const last = spoken[spoken.length - 1]
-    let outcome: RespondOutcome = 'none'
-    if (hasPeerNew && last?.role === 'peer') {
-      try {
-        outcome = await this.respond(title, observation)
-        this.respondFailures = 0
-      } catch (error) {
-        // 回复没有处理成功，把这批消息退回成“未见过”，下一轮重新处理；连续失败多次才放弃
-        this.respondFailures++
-        if (isAborted(error) || this.respondFailures < MAX_RESPOND_FAILURES) {
-          this.tracker.restore(title, before)
-          this.treatNextAsNew = this.treatNextAsNew || treatAllAsNew
-          this.forceObserve = true
-        } else {
-          this.respondFailures = 0
-          logger.warn(`「${title}」的回复连续失败，放弃这批消息`)
-        }
-        throw error
+    const key = `${chatType}:${normalizeTitle(title)}`
+    let newWork: ReplyWork | undefined
+    if (last?.role === 'self' && newMessages.includes(last) && observation.conversationTitle) {
+      this.replyWork.delete(key)
+    } else if (hasPeerNew && last?.role === 'peer') {
+      const waiting = this.replyWork.get(key)
+      if (waiting) {
+        if (observation.conversationTitle) waiting.source = { hwnd, title: observation.conversationTitle, messages: observation.messages }
+      } else {
+        const source = { hwnd, title: observation.conversationTitle, messages: observation.messages }
+        newWork = { key, contact: title, chatType, source, retryDelayMs: 0, retryAt: this.now() }
+        this.replyWork.set(key, newWork)
       }
     }
     if (newMessages.length > 0) this.deps.extractor.ingest(title, chatType, newMessages)
+    const outcome = newWork ? await this.respond(newWork, false) : 'none'
 
     // 当前会话处理完（回复、跳过或生成草稿）后继续看其他会话的未读，否则一个持续有新消息的会话会占满引擎
     if (outcome === 'sent') return settings.engine.afterReplyPollMs
@@ -414,29 +469,53 @@ export class Engine {
     }
   }
 
-  private async respond(title: string, observation: Observation): Promise<RespondOutcome> {
-    const settings = this.deps.settings()
-    const chatType = observation.isGroup ? 'group' : 'single'
-    const decision = await this.deps.brain.decide(
-      {
-        contact: title,
-        isGroup: observation.isGroup,
-        messages: observation.messages,
-        profile: this.deps.profiles.find(title, chatType)
-      },
-      this.opSignal()
-    )
+  private async retryReply(): Promise<void> {
+    const now = this.now()
+    let due: ReplyWork | undefined
+    for (const work of this.replyWork.values()) {
+      if (work.retryAt <= now && (!due || work.retryAt < due.retryAt)) due = work
+    }
+    if (!due) return
+    this.setPhase('RESPONDING')
+    await this.respond(due, true)
+    this.setPhase('POLLING')
+  }
+
+  private async respond(work: ReplyWork, retry: boolean): Promise<RespondOutcome> {
+    const { contact, chatType, source } = work
+    const { messages } = source
+    const signal = this.opSignal()
+    let decision: Awaited<ReturnType<ReplyBrain['decide']>>
+    try {
+      decision = await this.deps.brain.decide({
+        contact,
+        isGroup: chatType === 'group',
+        messages,
+        profile: this.deps.profiles.find(contact, chatType)
+      }, signal)
+    } catch (error) {
+      if (signal.aborted) throw new AbortedError()
+      if (!isAborted(error)) {
+        const baseDelay = this.deps.errorBackoffMs ?? 3000
+        work.retryDelayMs = Math.min(REPLY_RETRY_MAX_DELAY_MS, Math.max(baseDelay, work.retryDelayMs * 2))
+        work.retryAt = this.now() + work.retryDelayMs
+      }
+      throw error
+    }
+    if (signal.aborted) throw new AbortedError()
+
+    this.replyWork.delete(work.key)
     if (decision.action === 'skip') {
-      logger.info(`跳过回复「${title}」：${decision.reason || '无需回复'}`)
+      logger.info(`跳过回复「${contact}」：${decision.reason || '无需回复'}`)
       return 'skipped'
     }
-    if (settings.engine.replyMode === 'confirm') {
-      this.addPending(title, chatType, decision.text)
-      logger.info(`已生成待确认回复「${title}」（${decision.text.length} 字）`)
+    if (retry || this.deps.settings().engine.replyMode === 'confirm') {
+      this.addPending(contact, chatType, decision.text)
+      logger.info(`已生成待确认回复「${contact}」（${decision.text.length} 字）`)
       return 'pending'
     }
-    logger.info(`自动回复「${title}」（${decision.text.length} 字）`)
-    await this.sendText(decision.text)
+    logger.info(`自动回复「${contact}」（${decision.text.length} 字）`)
+    await this.sendReply({ contact, chatType, text: decision.text }, source)
     return 'sent'
   }
 
@@ -547,24 +626,99 @@ export class Engine {
     await this.deps.input.pause(200, 350, signal)
   }
 
-  // contact 不为空时先确认当前打开的就是该会话，不是就通过搜索切过去，避免草稿发到别的会话
-  private async sendText(text: string, contact?: { contact: string }): Promise<void> {
+  private async sendReply(item: OutboxItem, source?: AutoReplySource): Promise<void> {
     this.setPhase('EXECUTING')
+    const stopSignal = this.stopController?.signal
     const signal = this.opSignal()
-    await this.focusTarget(signal)
-    if (contact) await this.openConversation(contact.contact, signal)
-    await this.typeIntoInput(signal, async () => this.deps.input.paste(text, signal))
-    this.afterSend()
+    const progress: SendProgress = { attempted: false, keysReturned: false }
+    let pasteAttempted = false
+    try {
+      if (source) {
+        const { verified, check } = await this.verifyAutoReply(source, item.chatType, signal)
+        await this.typeIntoInput(signal, () => this.deps.input.paste(item.text, signal, async () => {
+          await check()
+          pasteAttempted = true
+        }), progress, { verified, check })
+      } else {
+        await this.focusTarget(signal)
+        await this.openConversation(item.contact, signal)
+        await this.typeIntoInput(signal, () => this.deps.input.paste(item.text, signal), progress)
+      }
+    } catch (error) {
+      if (stopSignal?.aborted) throw error
+      if (!progress.attempted) {
+        this.addPending(item.contact, item.chatType, item.text)
+        if (source) this.afterSend()
+        if (source && pasteAttempted && !isAborted(error)) {
+          throw new Error(`${(error as Error).message}；未尝试发送，文本可能留在聊天输入框`)
+        }
+        throw error
+      }
+      this.afterSend()
+      if (progress.keysReturned && isAborted(error)) return
+      throw new Error(`「${item.contact}」的发送结果不确定，请先核对聊天记录`)
+    }
+    if (!stopSignal?.aborted) this.afterSend()
   }
 
-  private async typeIntoInput(signal: AbortSignal, fill: () => Promise<void>): Promise<void> {
-    const { observation, frame } = await this.freshObservation(signal)
-    if (!observation.inputArea) throw new Error('未识别到消息输入框')
-    const point = normBoxToScreenPoint(observation.inputArea, frame.screenRect, SAFE_RANGES.messageInput)
-    await this.deps.input.clickAt(point, signal)
+  private async verifyAutoReply(source: AutoReplySource, chatType: OutboxItem['chatType'], signal: AbortSignal): Promise<AutoReplyGuard> {
+    const isGroup = chatType === 'group'
+    const title = autoReplyTitle(source.title, isGroup)
+    const anchor = replyAnchor(source.messages)
+    if (!title || anchor.length === 0) throw new Error('无法核对自动回复的原会话')
+
+    const foreground = async (): Promise<TargetWindow> => {
+      if (signal.aborted) throw new AbortedError()
+      const window = await this.deps.windows.getForeground()
+      if (signal.aborted) throw new AbortedError()
+      if (!window || window.hwnd !== source.hwnd || this.target?.hwnd !== source.hwnd) {
+        throw new Error('自动回复的原窗口不在前台')
+      }
+      return window
+    }
+    const window = await foreground()
+    const maxImageSide = this.deps.settings().vision.maxImageSide
+    const { frame, thumbnail } = await this.deps.capture(window, maxImageSide)
+    if (!sameRect(frame.screenRect, window.rect)) throw new Error('自动回复的原窗口未完整显示')
+    const observation = await this.deps.vision.observe(frame, { signal })
+    if (observation.isGroup !== isGroup || autoReplyTitle(observation.conversationTitle, isGroup) !== title) {
+      throw new Error('当前会话与自动回复的原会话不一致')
+    }
+    const currentAnchor = replyAnchor(observation.messages)
+    if (currentAnchor.length !== anchor.length || currentAnchor.some((entry, i) => entry !== anchor[i])) {
+      throw new Error('当前消息与生成回复时的消息不一致')
+    }
+    const { chatArea, inputArea } = observation
+    if (!chatArea || !inputArea || chatArea[3] <= chatArea[1] || inputArea[1] <= chatArea[1] ||
+        chatArea[2] <= chatArea[0] || inputArea[2] <= inputArea[0] || inputArea[3] <= inputArea[1]) {
+      throw new Error('无法定位自动回复的消息区或输入框')
+    }
+    const chatAndHeader: NormBox = [chatArea[0], 0, chatArea[2], Math.min(chatArea[3], inputArea[1])]
+    const check = async (): Promise<void> => {
+      const current = await foreground()
+      if (!sameRect(window.rect, current.rect)) throw new Error('自动回复的原窗口位置或尺寸已变化')
+      const fresh = await this.deps.capture(current, maxImageSide)
+      if (signal.aborted) throw new AbortedError()
+      if (!sameRect(frame.screenRect, fresh.frame.screenRect) ||
+          changedFractionInBox(thumbnail, fresh.thumbnail, chatAndHeader) > 0) {
+        throw new Error('自动回复复核后聊天画面已变化')
+      }
+    }
+    return { verified: { frame, inputArea }, check }
+  }
+
+  private async typeIntoInput(signal: AbortSignal, fill: () => Promise<void>, progress?: SendProgress, guard?: AutoReplyGuard): Promise<void> {
+    const source = guard?.verified ?? await this.freshObservation(signal).then(({ observation, frame }) => ({ frame, inputArea: observation.inputArea }))
+    if (!source.inputArea) throw new Error('未识别到消息输入框')
+    const point = normBoxToScreenPoint(source.inputArea, source.frame.screenRect, SAFE_RANGES.messageInput)
+    await this.deps.input.clickAt(point, signal, guard?.check)
     await fill()
     await this.deps.input.pause(250, 400, signal)
-    await this.deps.input.sendKeys(this.deps.settings().input.sendKeys, signal)
+    if (guard) await guard.check()
+    if (signal.aborted) throw new AbortedError()
+    if (progress) progress.attempted = true
+    await this.deps.input.sendKeys(this.deps.settings().input.sendKeys, signal, guard?.check)
+    if (progress) progress.keysReturned = true
     await this.deps.input.pause(500, 800, signal)
   }
 

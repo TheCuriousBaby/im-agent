@@ -41,21 +41,25 @@ export class InputController {
     this.check(signal)
   }
 
-  async clickAt(point: Point, signal?: AbortSignal): Promise<void> {
+  async clickAt(point: Point, signal?: AbortSignal, beforeClick?: () => Promise<void>): Promise<void> {
     this.check(signal)
     await this.backend.moveTo(point, this.humanize())
     await this.pause(80, 200, signal)
+    if (beforeClick) await beforeClick()
+    this.check(signal)
     await this.backend.click('left')
     await this.pause(50, 150, signal)
   }
 
   // 把文本写入剪贴板并粘贴，结束后恢复原剪贴板内容
-  async paste(text: string, signal?: AbortSignal): Promise<void> {
+  async paste(text: string, signal?: AbortSignal, beforePaste?: () => Promise<void>): Promise<void> {
     this.check(signal)
     const previous = this.clipboard.readText()
     try {
       this.clipboard.writeText(text)
       await this.pause(200, 300, signal)
+      if (beforePaste) await beforePaste()
+      this.check(signal)
       await this.backend.keyTap('v', ['control'])
       await this.pause(300, 500, signal)
     } finally {
@@ -77,7 +81,7 @@ export class InputController {
     }
   }
 
-  async sendKeys(mode: SendKeysMode, signal?: AbortSignal): Promise<void> {
+  async sendKeys(mode: SendKeysMode, signal?: AbortSignal, beforeAdditionalKey?: () => Promise<void>): Promise<void> {
     this.check(signal)
     if (mode === 'enter') {
       await this.backend.keyTap('enter')
@@ -86,8 +90,12 @@ export class InputController {
     } else {
       await this.backend.keyTap('enter')
       await this.pause(100, 140, signal)
+      if (beforeAdditionalKey) await beforeAdditionalKey()
+      this.check(signal)
       await this.backend.keyTap('enter', ['control'])
       await this.pause(50, 90, signal)
+      if (beforeAdditionalKey) await beforeAdditionalKey()
+      this.check(signal)
       await this.backend.keyTap('backspace')
     }
   }

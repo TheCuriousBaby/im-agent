@@ -11,6 +11,7 @@ import type {
   TaskMessage,
   TaskReport
 } from '../../shared/types'
+import type { ReplyDecision, ReplyInput } from '../brain/replyBrain'
 import type { CapturedFrame } from '../capture/screenshot'
 import type { InputBackend } from '../executor/inputBackend'
 import { InputController } from '../executor/inputController'
@@ -44,6 +45,7 @@ function observation(title: string, messages: ObservedMessage[], extra: Partial<
 
 class FakeBackend implements InputBackend {
   calls: string[] = []
+  onKeyTap?: (key: string) => void
   async moveTo(point: { x: number; y: number }): Promise<void> {
     this.calls.push(`move:${point.x},${point.y}`)
   }
@@ -52,6 +54,7 @@ class FakeBackend implements InputBackend {
   }
   async keyTap(key: string, modifiers: string[] = []): Promise<void> {
     this.calls.push(`key:${[...modifiers, key].join('+')}`)
+    this.onKeyTap?.(key)
   }
   async typeString(): Promise<void> {}
   async scroll(): Promise<void> {}
@@ -72,13 +75,14 @@ interface Harness {
 }
 
 // 与真实缩略图同尺寸的 BGRA 位图：右下角区域按 flip 交替，保证整帧检测能看到变化；会话列表区域随 listVersion 变化
-function makeThumbnail(flip: boolean, listVersion: number): Uint8Array {
+function makeThumbnail(flip: boolean, listVersion: number, chatVersion: number): Uint8Array {
   const data = new Uint8Array(THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4).fill(120)
   const paint = (x0: number, x1: number, y0: number, y1: number, value: number): void => {
     for (let y = y0; y < y1; y++) data.fill(value, (y * THUMBNAIL_WIDTH + x0) * 4, (y * THUMBNAIL_WIDTH + x1) * 4)
   }
-  if (flip) paint(100, THUMBNAIL_WIDTH, 96, THUMBNAIL_HEIGHT, 0)
+  if (flip) paint(100, THUMBNAIL_WIDTH, 108, THUMBNAIL_HEIGHT, 0)
   if (listVersion % 2 === 1) paint(0, 56, 10, 110, 30)
+  if (chatVersion % 2 === 1) paint(80, 140, 5, 55, 30)
   return data
 }
 
@@ -97,6 +101,10 @@ function harness(
     failDecideTimes?: number
     failVisionTimes?: number
     listState?: { version: number }
+    chatState?: { version: number }
+    getForeground?: () => TargetWindow | null
+    sendKeys?: Settings['input']['sendKeys']
+    decideFn?: (input: ReplyInput) => ReplyDecision
     visionFn?: (call: VisionCall, index: number) => Observation
   } = {}
 ): Harness {
@@ -106,6 +114,7 @@ function harness(
   settings.engine.replyMode = options.replyMode ?? 'confirm'
   settings.engine.idleRefreshMs = options.idleRefreshMs ?? 0
   settings.input.humanize = false
+  settings.input.sendKeys = options.sendKeys ?? 'enter'
 
   const backend = new FakeBackend()
   const clipboardWrites: string[] = []
@@ -141,14 +150,18 @@ function harness(
         screenRect: { ...TARGET.rect },
         takenAt: 0
       },
-      thumbnail: makeThumbnail(!options.staticFrames && frameNo % 2 === 0, options.listState?.version ?? 0)
+      thumbnail: makeThumbnail(!options.staticFrames && frameNo % 2 === 0, options.listState?.version ?? 0, options.chatState?.version ?? 0)
     }
   }
 
   state.engine = new Engine({
     settings: () => settings,
     capture,
-    windows: { getInfo: async () => TARGET, focus: async () => true },
+    windows: {
+      getInfo: async () => TARGET,
+      focus: async () => true,
+      getForeground: async () => options.getForeground ? options.getForeground() : TARGET
+    },
     vision: {
       observe: async (_frame, observeOptions) => {
         const callIndex = state.visionCalls
@@ -161,9 +174,10 @@ function harness(
       }
     },
     brain: {
-      decide: async () => {
+      decide: async (input) => {
         state.decideCalls++
         if (state.decideCalls <= (options.failDecideTimes ?? 0)) throw new Error('模型输出无法解析')
+        if (options.decideFn) return options.decideFn(input)
         if (options.skip) return { action: 'skip', text: '', reason: '群聊闲聊' }
         return { action: 'reply', text: options.reply ?? '收到，稍后回复你', reason: '' }
       }
@@ -242,6 +256,92 @@ test('自动模式：新消息直接点击输入框、粘贴并发送', async ()
   assert.ok(h.backend.calls.includes('click'))
   const clickIndex = h.backend.calls.indexOf('click')
   assert.ok(h.backend.calls[clickIndex - 1].startsWith('move:'))
+})
+
+test('自动发送复核拒绝近似会话名、空标题、不同会话类型和新消息', async (t) => {
+  const history = [msg('peer', '你好')]
+  const request = [...history, msg('peer', '在吗')]
+  const original = observation('项目群', request, { isGroup: true })
+  const candidates: [string, Observation][] = [
+    ['近似名称', { ...original, conversationTitle: '项目群测试' }],
+    ['识别不到标题', { ...original, conversationTitle: '' }],
+    ['会话类型不同', { ...original, isGroup: false }],
+    ['消息已经更新', { ...original, messages: [...request, msg('peer', '还有一个问题')] }]
+  ]
+  for (const [name, current] of candidates) {
+    await t.test(name, async (sub) => {
+      const h = harness([observation('项目群', history, { isGroup: true }), original, current], {
+        replyMode: 'auto', reply: '需要确认的答复'
+      })
+      sub.after(() => { h.engine.stop() })
+      h.engine.start(TARGET)
+      await waitFor(() => h.engine.status().pendingCount === 1)
+      assert.equal(h.engine.status().pendingReply?.contact, '项目群')
+      assert.equal(h.engine.status().pendingReply?.text, '需要确认的答复')
+      assert.deepEqual(h.backend.calls, [])
+      assert.deepEqual(h.clipboardWrites, [])
+    })
+  }
+})
+
+test('复核识图期间聊天画面变化，移动鼠标后也不会点击或粘贴', async (t) => {
+  const chatState = { version: 0 }
+  const history = [msg('peer', '你好')]
+  const h = harness([], {
+    chatState,
+    replyMode: 'auto',
+    visionFn: (_call, index) => {
+      if (index === 2) chatState.version++
+      return observation('Alice', index === 0 ? history : [...history, msg('peer', '在吗')])
+    }
+  })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingCount === 1)
+  assert.equal(h.backend.calls.includes('click'), false)
+  assert.deepEqual(h.clipboardWrites, [])
+})
+
+test('自动回复粘贴后聊天画面变化或焦点丢失，保留草稿但不按发送键', async (t) => {
+  for (const kind of ['聊天画面变化', '焦点丢失']) {
+    await t.test(kind, async (sub) => {
+      const history = [msg('peer', '你好')]
+      const chatState = { version: 0 }
+      let foreground = TARGET
+      const h = harness([observation('Alice', history), observation('Alice', [...history, msg('peer', '在吗')])], {
+        chatState, getForeground: () => foreground, replyMode: 'auto'
+      })
+      h.backend.onKeyTap = (key) => {
+        if (key !== 'v') return
+        if (kind === '聊天画面变化') chatState.version++
+        else foreground = { ...TARGET, hwnd: '2' }
+      }
+      sub.after(() => { h.engine.stop() })
+      h.engine.start(TARGET)
+      await waitFor(() => h.engine.status().pendingCount === 1)
+      assert.ok(h.backend.calls.includes('key:control+v'))
+      assert.equal(h.backend.calls.includes('key:enter'), false)
+      assert.equal(h.engine.status().pendingReply?.contact, 'Alice')
+    })
+  }
+})
+
+test('自动回复兼容键序列中途失焦，不继续按其他键或生成补发草稿', async (t) => {
+  const history = [msg('peer', '你好')]
+  let foreground = TARGET
+  const h = harness([observation('Alice', history), observation('Alice', [...history, msg('peer', '在吗')])], {
+    getForeground: () => foreground, replyMode: 'auto', sendKeys: 'compat'
+  })
+  h.backend.onKeyTap = (key) => {
+    if (key === 'enter') foreground = { ...TARGET, hwnd: '2' }
+  }
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.statuses.some((status) => status.lastError?.includes('发送结果不确定')))
+  assert.equal(h.backend.calls.filter((call) => call === 'key:enter').length, 1)
+  assert.equal(h.backend.calls.includes('key:control+enter'), false)
+  assert.equal(h.backend.calls.includes('key:backspace'), false)
+  assert.equal(h.engine.status().pendingCount, 0)
 })
 
 test('最后一条是自己发的消息时不回复', async () => {
@@ -481,6 +581,115 @@ test('回复决策失败后，新消息不会被当作已处理，重试后仍�
   h.engine.stop()
   assert.equal(h.decideCalls >= 2, true)
   assert.equal(pending?.text, '重试后的回复')
+})
+
+test('自动模式下固定画面连续生成失败超过三次，恢复后只生成待确认草稿', async (t) => {
+  const list = { version: 0 }
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', '在吗')])
+  ], { replyMode: 'auto', staticFrames: true, listState: list, failDecideTimes: 4 })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.visionCalls === 1)
+  list.version++
+  await waitFor(() => h.engine.status().pendingReply !== null)
+  assert.equal(h.decideCalls, 5)
+  assert.equal(h.visionCalls, 2)
+  assert.equal(h.engine.status().pendingReply?.contact, 'Alice')
+  assert.equal(h.backend.calls.length, 0)
+})
+
+test('原会话不可见时仍可重试，期间其他会话可以生成回复', async (t) => {
+  let aliceAttempts = 0
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', 'Alice 的问题')]),
+    observation('Bob', history),
+    observation('Bob', [...history, msg('peer', 'Bob 的问题')])
+  ], {
+    decideFn: ({ contact, messages }) => {
+      if (contact === 'Alice' && ++aliceAttempts <= 4) throw new Error('回复模型暂不可用')
+      return { action: 'reply', text: messages[messages.length - 1].text, reason: '' }
+    }
+  })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingCount === 2)
+  assert.equal(h.engine.status().pendingReply?.text, 'Bob 的问题')
+  const bob = h.engine.status().pendingReply
+  if (bob) h.engine.discardReply(bob.id)
+  assert.equal(h.engine.status().pendingReply?.text, 'Alice 的问题')
+  assert.equal(aliceAttempts, 5)
+})
+
+test('自动回复在调用发送键前失败时保留已生成的草稿', async (t) => {
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', '在吗')], { inputArea: null })
+  ], { replyMode: 'auto', reply: '保留这份回复' })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().pendingReply !== null)
+  assert.equal(h.engine.status().pendingReply?.text, '保留这份回复')
+  assert.equal(h.decideCalls, 1)
+  assert.equal(h.backend.calls.includes('key:enter'), false)
+})
+
+test('发送键调用报错时提醒核对聊天记录，不重新生成或补发', async (t) => {
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', '在吗')])
+  ], { replyMode: 'auto' })
+  h.backend.onKeyTap = (key) => {
+    if (key === 'enter') throw new Error('输入执行超时')
+  }
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.statuses.some((status) => status.lastError?.includes('发送结果不确定')))
+  const visionCalls = h.visionCalls
+  await waitFor(() => h.visionCalls >= visionCalls + 3)
+  assert.equal(h.decideCalls, 1)
+  assert.equal(h.engine.status().pendingCount, 0)
+  assert.equal(h.backend.calls.filter((call) => call === 'key:enter').length, 1)
+})
+
+test('等待重试时发现己方已有新回复，不再为旧消息生成草稿', async (t) => {
+  const history = [msg('peer', '你好')]
+  const request = [...history, msg('peer', '在吗')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', request),
+    observation('Alice', [...request, msg('self', '已经处理')])
+  ], { failDecideTimes: 1 })
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.visionCalls >= 6)
+  assert.equal(h.decideCalls, 1)
+  assert.equal(h.engine.status().pendingCount, 0)
+})
+
+test('发送键返回后的暂停不触发重新生成或补发', async (t) => {
+  const history = [msg('peer', '你好')]
+  const h = harness([
+    observation('Alice', history),
+    observation('Alice', [...history, msg('peer', '在吗')])
+  ], { replyMode: 'auto' })
+  h.backend.onKeyTap = (key) => {
+    if (key === 'enter') h.engine.pause()
+  }
+  t.after(() => { h.engine.stop() })
+  h.engine.start(TARGET)
+  await waitFor(() => h.engine.status().paused)
+  h.engine.resume()
+  await waitFor(() => h.visionCalls >= 5)
+  assert.equal(h.decideCalls, 1)
+  assert.equal(h.engine.status().pendingCount, 0)
+  assert.equal(h.backend.calls.filter((call) => call === 'key:enter').length, 1)
 })
 
 test('点击未读前会话列表已被重排，会重新识别并按新位置点击', async () => {
